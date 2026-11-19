@@ -52,6 +52,7 @@ private:
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
+#include "basalt/kernels/volta_compat.cuh"
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
 #define PDL_LAUNCH 1

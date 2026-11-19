@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -386,11 +387,11 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(gmem) : "memory");
+    basalt::volta::cp_async_cg16(sa, gmem);
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_async_commit() { basalt::volta::cp_async_commit(); }
+__device__ __forceinline__ void cp_async_wait1() { basalt::volta::cp_async_wait<1>(); }
+__device__ __forceinline__ void cp_async_wait0() { basalt::volta::cp_async_wait<0>(); }
 
 // `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
 __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const float4 x1) {
@@ -876,13 +877,18 @@ void fused_gr_check() {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
-    const int want = kHcStaged;
+    // BASALT_HC_READ=1 (plain), 2 (split), 3 (staged, the default); a variant that fails its check is never taken
+    static const int want = [] {
+        const char* e = std::getenv("BASALT_HC_READ");
+        const int v = e != nullptr ? std::atoi(e) : kHcStaged;
+        return v >= kHcPlain && v <= kHcStaged ? v : kHcStaged;
+    }();
     bool okv[4];
     std::string why[4];
     const bool ran = fused_gr_selftest(okv, why);
     int use = kHcPlain;
     if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
-    else if (okv[kHcSplit]) use = kHcSplit;
+    else if (want >= kHcSplit && okv[kHcSplit]) use = kHcSplit;   // want = plain keeps the plain read
     g_variant[dev].store(use);
     if (!ran)
         basalt::log::warn("basalt hc", "CUDA%d: the check of split/staged could not run (%s)", dev, why[0].c_str());

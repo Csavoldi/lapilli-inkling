@@ -51,6 +51,7 @@
 #include <cstdlib>
 #include <mutex>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::prefill::fused {
 namespace {
@@ -130,33 +131,25 @@ __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, 
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
-                 "l"(src));
+    basalt::volta::cp_async_cg16((unsigned) __cvta_generic_to_shared(dst), src);
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cp_commit() { basalt::volta::cp_async_commit(); }
 __device__ __forceinline__ void pf_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p)); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+template <int N> __device__ __forceinline__ void cp_wait() { basalt::volta::cp_async_wait<N>(); }
 // d = MAGIC + A (16 x 32 s8, row) * B (32 x 8 s8, col): the int32 dot with the magic bias already added (the C
 // operand), so as_float(d) - 1.5 * 2^23 is the dot as a float
 __device__ __forceinline__ void mma32(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(MAGIC));
+    basalt::volta::mma_16832_s32_s8<false>(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b0, b1, MAGIC, MAGIC, MAGIC, MAGIC);
 }
 // the same at m16n8k16 (A 16 x 16, B 16 x 8)
 __device__ __forceinline__ void mma16(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
-    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a0), "r"(a1), "r"(b0), "r"(MAGIC));
+    basalt::volta::mma_16816_s32_s8(d[0], d[1], d[2], d[3], a0, a1, b0, MAGIC, MAGIC, MAGIC, MAGIC);
 }
 __device__ __forceinline__ float dotf(int d) { return __int_as_float(d) - MAGICF; }
 // four 8 x 16-byte matrices, row addresses from lanes 0-7, 8-15, 16-23, 24-31: lane (g, t) gets bytes 4t..4t+3 of row g
 // of each - an mma fragment
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"((unsigned) __cvta_generic_to_shared(p))
-                 : "memory");
+    basalt::volta::ldmatrix_x4<false>(r[0], r[1], r[2], r[3], (unsigned) __cvta_generic_to_shared(p));
 }
 
 // ---- the load stage: a 32-value sub-block's bytes into registers, then int8 and scales
@@ -300,8 +293,7 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
 
 // ---- v2's helpers
 __device__ __forceinline__ void cp4(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
-                 "l"(src));
+    basalt::volta::cp_async_ca<4>((unsigned) __cvta_generic_to_shared(dst), src);
 }
 // 32 bits at an even offset of shared memory
 __device__ __forceinline__ uint32_t lds32_2a(const uint8_t* sm, uint32_t off) {

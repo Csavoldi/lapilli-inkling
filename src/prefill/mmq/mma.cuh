@@ -9,6 +9,7 @@
 #pragma once
 
 #include "mmq_common.cuh"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace ggml_cuda_mma {
 
@@ -60,9 +61,13 @@ namespace ggml_cuda_mma {
             tile<8, 8, T> & t, const T * __restrict__ xs0, const int stride) {
         int * xi = (int *) t.x;
         const int * xs = (const int *) xs0 + (threadIdx.x % t.I) * stride + ((threadIdx.x / t.I) * (t.J / 2)) % t.J;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        basalt::volta::ldsm_ptr<2>(xi, xs);
+#else
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
             : "=r"(xi[0]), "=r"(xi[1])
             : "l"(xs));
+#endif
     }
 
     template <typename T>
@@ -70,9 +75,13 @@ namespace ggml_cuda_mma {
             tile<16, 4, T> & t, const T * __restrict__ xs0, const int stride) {
         int * xi = (int *) t.x;
         const int * xs = (const int *) xs0 + (threadIdx.x % t.I) * stride;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        basalt::volta::ldsm_ptr<2>(xi, xs);
+#else
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
             : "=r"(xi[0]), "=r"(xi[1])
             : "l"(xs));
+#endif
     }
 
     template <typename T>
@@ -80,22 +89,22 @@ namespace ggml_cuda_mma {
             tile<16, 8, T> & t, const T * __restrict__ xs0, const int stride) {
         int * xi = (int * ) t.x;
         const int * xs = (const int *) xs0 + (threadIdx.x % t.I) * stride + (threadIdx.x / t.I) * (t.J / 2);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        basalt::volta::ldsm_ptr<4>(xi, xs);
+#else
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
             : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
             : "l"(xs));
+#endif
     }
 
     static __device__ __forceinline__ void mma(
             tile<16, 8, int> & D, const tile<16, 4, int> & A, const tile<8, 4, int> & B) {
-        asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
-            : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
-            : "r"(A.x[0]), "r"(A.x[1]), "r"(B.x[0]));
+        basalt::volta::mma_16816_s32_s8(D.x[0], D.x[1], D.x[2], D.x[3], A.x[0], A.x[1], B.x[0], D.x[0], D.x[1], D.x[2], D.x[3]);
     }
 
     static __device__ __forceinline__ void mma(
             tile<16, 8, int> & D, const tile<16, 8, int> & A, const tile<8, 8, int> & B) {
-        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-            : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
-            : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]), "r"(B.x[1]));
+        basalt::volta::mma_16832_s32_s8<false>(D.x[0], D.x[1], D.x[2], D.x[3], A.x[0], A.x[1], A.x[2], A.x[3], B.x[0], B.x[1], D.x[0], D.x[1], D.x[2], D.x[3]);
     }
 }

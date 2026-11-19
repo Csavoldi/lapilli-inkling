@@ -11,6 +11,7 @@
 // asked for a few stages before the K loop ends), the consumers write their rounded values into the tile and TMA
 // stores write it out, so no thread waits on a load or a store of its own; the tile's token scales are copied into
 // shared memory at the block's start for the same reason.  FP32 outputs go straight from the accumulators.
+#include "basalt/kernels/volta_sm100.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 
 #include "basalt/kernels/silu.cuh"
@@ -28,6 +29,7 @@
 #include <type_traits>
 
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::prefill::fp4_dense {
 namespace {
@@ -56,10 +58,10 @@ void ck(cudaError_t e, const char* what) {
 __device__ __forceinline__ uint32_t smem_addr(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 
 __device__ __forceinline__ void mbar_init(uint64_t* b, uint32_t n) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_addr(b)), "r"(n) : "memory");
+    BASALT_SM100_ASM("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_addr(b)), "r"(n) : "memory");
 }
 __device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t phase) {
-    asm volatile("{\n.reg .pred done;\nwait_loop_%=:\n"
+    BASALT_SM100_ASM("{\n.reg .pred done;\nwait_loop_%=:\n"
                  "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1, %2;\n"
                  "@done bra wait_done_%=;\nbra wait_loop_%=;\nwait_done_%=:\n}\n"
                  :
@@ -67,17 +69,17 @@ __device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t phase) {
                  : "memory");
 }
 __device__ __forceinline__ void mbar_arrive(uint64_t* b) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_addr(b)) : "memory");
+    BASALT_SM100_ASM("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_addr(b)) : "memory");
 }
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* b, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_addr(b)), "r"(bytes) : "memory");
+    BASALT_SM100_ASM("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_addr(b)), "r"(bytes) : "memory");
 }
 // Each thread that read a stage with generic-proxy loads orders them before the async-proxy refill (the empty arrive
 // alone orders them only against generic writes).
-__device__ __forceinline__ void fence_reads_before_refill() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+__device__ __forceinline__ void fence_reads_before_refill() { BASALT_SM100_ASM("fence.proxy.async.shared::cta;" ::: "memory"); }
 
 __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, int c0, int c1, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+    BASALT_SM100_ASM("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  :
                  : "r"(smem_addr(dst)), "l"(map), "r"(c0), "r"(c1), "r"(smem_addr(bar))
                  : "memory");
@@ -86,35 +88,33 @@ __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, i
 // The tile at `src` out to the map at (c0, c1); stores_read waits until every store issued has read its tile (the block
 // may then end).
 __device__ __forceinline__ void tma_store_2d(const CUtensorMap* map, int c0, int c1, const void* src) {
-    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+    BASALT_SM100_ASM("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                  :
                  : "l"(map), "r"(c0), "r"(c1), "r"(smem_addr(src))
                  : "memory");
 }
 __device__ __forceinline__ void stores_read() {
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+    BASALT_SM100_ASM("cp.async.bulk.commit_group;" ::: "memory");
+    BASALT_SM100_ASM("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
 
 // 16 bytes to shared memory, the first `n` of them from src and zeros after
 __device__ __forceinline__ void cp16z(void* dst, const void* src, int n) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_addr(dst)), "l"(src), "r"(n) : "memory");
+    basalt::volta::cp_async_cg16(smem_addr(dst), src, n);
 }
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "r"(addr));
+    basalt::volta::ldmatrix_x4<false>(r0, r1, r2, r3, addr);
 }
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(addr));
+    basalt::volta::ldmatrix_x2<false>(r0, r1, addr);
 }
 
 // c += A (16 tokens x 64 values, E2M1 with a UE4M3 scale per 16) * B (64 x 8 weight rows, same format)
 __device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa,
                                         unsigned sfb) {
     constexpr unsigned short kId = 0;
-    asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+    BASALT_SM100_ASM("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(kId), "h"(kId),
@@ -206,12 +206,12 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
         }
         mbar_init(&sh.tile_in, 1);
         mbar_init(&sh.tile_out, kConsumerWarps);
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        BASALT_SM100_ASM("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
 
     if (threadIdx.x < kProducerThreads) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
+        BASALT_SM100_ASM("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
         if (threadIdx.x >= 32) return;
         // the producer warp: every lane keeps the ring's pace (so the lanes can each do a share of the copies and
         // prefetches below), the first lane issues the tensor copies
@@ -251,8 +251,8 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                 const int t = token_begin + c * 4;
                 cp16z(sh.gs + c * 4, p.gs + t, min(max(p.tokens - t, 0), 4) * 4);
             }
-            asm volatile("cp.async.commit_group;" ::: "memory");
-            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            basalt::volta::cp_async_commit();
+            basalt::volta::cp_async_wait<0>();
         }
         const int fetch_at = max(first, ktiles - kFetchStages);
 #pragma unroll 1
@@ -293,7 +293,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
         return;
     }
 
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+    BASALT_SM100_ASM("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
     const int ct = (int) threadIdx.x - kProducerThreads;
     const int lane = ct & 31, warp = ct >> 5;
     const int warp_m = warp >> 1, warp_n = warp & 1;   // token quarter, row half
@@ -567,7 +567,7 @@ __global__ void quantize_kernel(const In* __restrict__ x, uint8_t* __restrict__ 
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             unsigned short c;
-            asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u16.u8 %0, t; }"
+            BASALT_SM100_ASM("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u16.u8 %0, t; }"
                 : "=h"(c) : "f"(v[2 * j] * inv), "f"(v[2 * j + 1] * inv));   // the first source is the high nibble
             w[j >> 2] |= (uint32_t) (c & 0xff) << (8 * (j & 3));
         }

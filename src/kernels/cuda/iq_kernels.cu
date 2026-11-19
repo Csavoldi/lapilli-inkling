@@ -1383,6 +1383,29 @@ __device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8
         if (EXACT_N || c < n) s[c] = warp_sum(s[c]);
 }
 
+// row_dot_multi when every lane makes exactly U calls (nb * ipb == 32 * U, checked by the caller):
+// the same calls k = lane + 32 i in the same order, the same sums, the same warp_sum (the same bits), the loop unrolled so
+// that every load can leave before the first sum (one wait for the row instead of U).
+template<int TY, int NC, int U, bool EXACT_N = false, bool STAGE_GRID = false>
+__device__ __forceinline__ void row_dot_multi_u(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                int lane, float (&s)[NC], const uint32_t* __restrict__ s_grid = nullptr) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < U; ++i) {
+        const int k = lane + 32 * i, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const typename S::W w = S::template load<STAGE_GRID>(row, kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (EXACT_N || c < n) s[c] = warp_sum(s[c]);
+}
+
 // 8-lane sub-warp row dot for K = nb * ipb == 40 (IQ4_NL or NVFP4 down with n_ff == 640):
 // 4 rows per warp (32 rows per 256-thread block), 100% active lanes, bitwise identical addition tree to row_dot_multi.
 template<int TY, int NC, bool EXACT_N = false, bool PRE = false>
@@ -1591,8 +1614,8 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // so 6 takes such windows in one pass; 8 would take ~64-80 registers.
 constexpr int GRP_NC = 6;
 
-template<int TG, bool STAGE_GRID = kStageIqGrid<TG>>
-__global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
+template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, int MINB = 1, bool U5 = false>   // MINB blocks per SM at least; U5: row_dot_multi_u when nb * ipb == 160
+__global__ void __launch_bounds__(256, MINB) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
@@ -1619,13 +1642,23 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
             if (n == 1) {
                 const int off1[1] = { ent_tok[e] * xb };
                 float s1[1];
-                row_dot_multi<TG, 1, true, STAGE_GRID>(wr, xq, off1, 1, nb, lane, s1, s_grid);
+                if constexpr (U5) {   // the same calls, unrolled
+                    if (nb * Fmt<TG>::ipb == 160) row_dot_multi_u<TG, 1, 5, true, STAGE_GRID>(wr, xq, off1, 1, lane, s1, s_grid);
+                    else row_dot_multi<TG, 1, true, STAGE_GRID>(wr, xq, off1, 1, nb, lane, s1, s_grid);
+                } else {
+                    row_dot_multi<TG, 1, true, STAGE_GRID>(wr, xq, off1, 1, nb, lane, s1, s_grid);
+                }
                 tail_scale<TG>(s1, sc);
                 if (lane == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
             } else if (n == 2) {
                 const int off2[2] = { ent_tok[e] * xb, ent_tok[e + 1] * xb };
                 float s2[2];
-                row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
+                if constexpr (U5) {   // the same calls, unrolled
+                    if (nb * Fmt<TG>::ipb == 160) row_dot_multi_u<TG, 2, 5, true, STAGE_GRID>(wr, xq, off2, 2, lane, s2, s_grid);
+                    else row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
+                } else {
+                    row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
+                }
                 tail_scale<TG>(s2, sc);
                 if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane];
             } else {
@@ -1743,18 +1776,15 @@ size_t gu_mma_smem(int64_t n_embd) {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void gm_cp4(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src)
-                 : "memory");
+    basalt::volta::cp_async_ca<4>((unsigned) __cvta_generic_to_shared(dst), src);
 }
-__device__ __forceinline__ void gm_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void gm_commit() { basalt::volta::cp_async_commit(); }
 template<int N> __device__ __forceinline__ void gm_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+    basalt::volta::cp_async_wait<N>();
 }
 // d = A (16 x 32 s8, row) * B (32 x 8 s8, col), C = 0: the exact int32 dots
 __device__ __forceinline__ void gm_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    basalt::volta::mma_16832_s32_s8<false>(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b0, b1, 0, 0, 0, 0);
 }
 // the 4 sign bits of grid word w (0..7) of a sub-block: group w / 2's 7 bits with their parity as bit 7
 // (unpack_ksigns), bits 4 (w & 1) .. 4 (w & 1) + 3
@@ -1955,8 +1985,7 @@ static_assert(kGmCols * M3Cfg<1>::R * 9 * 4 <= M3Cfg<1>::RING && kGmCols * M3Cfg
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void gm_cp16(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
-                 "l"(src) : "memory");
+    basalt::volta::cp_async_ca<16>((unsigned) __cvta_generic_to_shared(dst), src);
 }
 // Row `bp` (an IQ3_S block in shared memory, 2-byte aligned), sub-block ib: the signed grid words t and 4 + t (values
 // 4t..4t+3 and 16+4t..16+4t+3, the A fragment's; sign bit v of the sub-block's 32 is value v's), the integer scale
@@ -2151,8 +2180,8 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
 
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
 // block's first group's weight rows are prefetched into L2 before the wait (and, for IQ4_NL, loaded into registers).
-template<int TD, bool DEP = false>
-__global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
+template<int TD, bool DEP = false, int MINB = 1>   // MINB blocks per SM at least
+__global__ void __launch_bounds__(256, MINB) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
                                                                 const int32_t* __restrict__ ent_dst,
@@ -2991,6 +3020,46 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
 }
 
 #include "gu2.cuh"
+#include "basalt/kernels/volta_compat.cuh"
+
+// BASALT_EXP_LB (read once): 0 the upstream kernels, 1 the down kernel at 3 blocks per SM, 2 also the gate/up kernel at 4,
+// 3 the down kernel at 4 blocks per SM, the gate/up kernel unchanged
+int exp_lb_level() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_EXP_LB");
+        v = (e != nullptr && *e != 0) ? std::atoi(e) : 3;   // 3 by default
+        if (v < 0 || v > 3) v = 0;   // any other value: 0
+    }
+    return v;
+}
+
+// BASALT_GU_U5=1 (3 blocks per SM) or 2 (2 blocks): the gate/up kernel with U5, read once; 0: as upstream
+int gu_u5() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_GU_U5");
+        const int n = (e != nullptr && *e != 0) ? std::atoi(e) : 1;   // on by default
+        v = (n == 1 || n == 2) ? n : 0;
+    }
+    return v;
+}
+template<int TG>
+bool gu_u5_launch(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                  const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+                  float* gate, float* up) {
+    if constexpr (TG == 12 || TG == 13) {
+        const int u = gu_u5();
+        if (u == 0 || (int) (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb != 160) return false;
+        if (u == 2) native_gu_multi_kernel<TG, kStageIqGrid<TG>, 2, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else native_gu_multi_kernel<TG, kStageIqGrid<TG>, 3, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        return true;
+    } else {
+        (void) grid; (void) s; (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_tok; (void) X; (void) L;
+        (void) gate; (void) up;
+        return false;
+    }
+}
 
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
@@ -3026,11 +3095,20 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
     }
     else if constexpr (kStageIqGrid<TG>) {
         if (!g_stage_grid) {
-            native_gu_multi_kernel<TG, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            if (exp_lb_level() == 2)   // the gate/up kernel at 4 blocks per SM
+                native_gu_multi_kernel<TG, false, 4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else
+                native_gu_multi_kernel<TG, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }
-        native_gu_multi_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-    } else native_gu_multi_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        if (exp_lb_level() == 2)
+            native_gu_multi_kernel<TG, kStageIqGrid<TG>, 4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else
+            native_gu_multi_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    } else if (exp_lb_level() == 2)
+        native_gu_multi_kernel<TG, kStageIqGrid<TG>, 4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    else if (gu_u5_launch<TG>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up)) {}   // BASALT_GU_U5
+    else native_gu_multi_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
 }
 
 // The rows native_down_sub8_kernel takes: kDownSub8Calls calls of a split format that native_down_multi_kernel runs
@@ -3052,7 +3130,18 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
         if (dep) launch_dependent(native_down_sub8_kernel<TD, true>, g8, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else native_down_sub8_kernel<TD><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     }
-    else if (dep) launch_dependent(native_down_multi_kernel<TD, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if (dep) {   // BASALT_EXP_LB >= 1: the down kernel at 3 blocks per SM (at 4 for level 3)
+        if (exp_lb_level() == 3)
+            launch_dependent(native_down_multi_kernel<TD, true, 4>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else if (exp_lb_level() >= 1)
+            launch_dependent(native_down_multi_kernel<TD, true, 3>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else
+            launch_dependent(native_down_multi_kernel<TD, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    }
+    else if (exp_lb_level() == 3)
+        native_down_multi_kernel<TD, false, 4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if (exp_lb_level() >= 1)
+        native_down_multi_kernel<TD, false, 3><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 

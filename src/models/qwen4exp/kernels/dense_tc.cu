@@ -11,6 +11,7 @@
 // Persistent: block b takes tiles b, b + G, ...; their chunks stream through one ring of S slots (16-byte cp.async
 // per thread, issued S - 1 chunks ahead across tile boundaries, the first ones before the grid dependency wait:
 // weights are constant).  The q8_1 columns are read through L1.
+#include "basalt/kernels/volta_smem.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/pdl.hpp"
 
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -62,14 +64,10 @@ __device__ __align__(4) int8_t dtc_iq4nl[16] = {-127, -104, -83, -65, -49, -35, 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 __device__ __forceinline__ void mma_k32(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+    basalt::volta::mma_16832_s32_s8<false>(d[0], d[1], d[2], d[3], a0, a1, a2, a3, b0, b1, 0, 0, 0, 0);
 }
 __device__ __forceinline__ void mma_k16(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
-    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+    basalt::volta::mma_16816_s32_s8(d[0], d[1], d[2], d[3], a0, a1, b0, 0, 0, 0, 0);
 }
 __device__ __forceinline__ uint32_t ld32(const uint8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
 __device__ __forceinline__ uint32_t ld32_b2(const uint8_t* p) {   // 2-byte aligned
@@ -377,12 +375,10 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
             const uintptr_t src = (uintptr_t) (w + (size_t) row * row_bytes + (size_t) c * CB);
             const uintptr_t a0 = src & ~(uintptr_t) 15;
             if (k * 16 < (int) (src - a0) + CB)
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                             ::"r"((unsigned) __cvta_generic_to_shared(dst + r * RS + 16 * k)), "l"(a0 + 16 * k)
-                             : "memory");
+                basalt::volta::cp_async_cg16((unsigned) __cvta_generic_to_shared(dst + r * RS + 16 * k), a0 + 16 * k);
         }
     };
-    auto commit = [] { asm volatile("cp.async.commit_group;\n" ::: "memory"); };
+    auto commit = [] { basalt::volta::cp_async_commit(); };
 #pragma unroll
     for (int q = 0; q < S - 1; ++q) {
         if (q < nunits) issue(q);
@@ -413,7 +409,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
                                           : 0.0f;
             }
         }
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(S - 2) : "memory");
+        basalt::volta::cp_async_wait<S - 2>();
         __syncthreads();   // unit u is in for every thread; the slot of unit u - 1 is free
         if (u + S - 1 < nunits) issue(u + S - 1);
         commit();
@@ -447,7 +443,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
             }
         }
     }
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    basalt::volta::cp_async_wait<0>();
 }
 #endif
 
@@ -974,7 +970,7 @@ __global__ void __launch_bounds__(32) dense_tc_l2_kernel(const uint8_t* __restri
                      hi = (size_t) (blockIdx.x + 1) * n16 / gridDim.x * 16;
         for (size_t o = lo; o < hi; o += 65536) {
             const unsigned sz = (unsigned) (hi - o < 65536 ? hi - o : 65536);
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(w + o), "r"(sz) : "memory");
+            basalt::volta::bulk_prefetch_l2(w + o, sz);
         }
     }
     pdl_launch_dependents();
@@ -1045,7 +1041,7 @@ void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, in
     static std::atomic<bool> attr[64];
     const int dev = opt_in_device("dense_tc_tile");
     if (!attr[dev].load(std::memory_order_acquire)) {
-        opt_in_check(cudaFuncSetAttribute(dense_tc_tile_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "dense_tc_tile");
+        opt_in_check(cudaFuncSetAttribute(dense_tc_tile_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, basalt::volta::smem_ceiling(99 * 1024)), "dense_tc_tile");
         attr[dev].store(true, std::memory_order_release);
     }
     int occ = 0;
@@ -1061,7 +1057,7 @@ void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, in
 template<int TYPE>
 bool one_ok(const void* w, int n_in, int n_out) {
     return ((uintptr_t) w & 15) == 0 && (n_in / 256) * Fmt<TYPE>::SB % 16 == 0 &&
-           (n_out + 15) / 16 <= sm_count() && one_smem_bytes<TYPE, 24>(n_in) <= 99 * 1024;
+           (n_out + 15) / 16 <= sm_count() && one_smem_bytes<TYPE, 24>(n_in) <= basalt::volta::smem_ceiling(99 * 1024);
 }
 
 template<int TYPE, int NW>
@@ -1069,7 +1065,7 @@ void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int
     static std::atomic<bool> attr[64];
     const int dev = opt_in_device("dense_tc_one");
     if (!attr[dev].load(std::memory_order_acquire)) {
-        opt_in_check(cudaFuncSetAttribute(dense_tc_one_kernel<TYPE, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "dense_tc_one");
+        opt_in_check(cudaFuncSetAttribute(dense_tc_one_kernel<TYPE, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, basalt::volta::smem_ceiling(99 * 1024)), "dense_tc_one");
         attr[dev].store(true, std::memory_order_release);
     }
     launch_pdl(dense_tc_one_kernel<TYPE, NW>, dim3((unsigned) ((n_out + 15) / 16)), dim3(NW * 32),
@@ -1106,11 +1102,27 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
 }  // namespace
 #ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 
+// The dense_tc kernels only have code from sm_90 on (below it, __trap()); on an older card the "supported" functions
+// return false and the mask is 0: each caller takes its fallback.
+static bool dense_tc_device_ok() noexcept {
+    static int known[64] = {};   // per card: 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    if (known[dev] == 0) {
+        int major = 0;
+        const bool q = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
+        if (!q) (void) cudaGetLastError();
+        known[dev] = q && major >= 9 ? 1 : 2;
+    }
+    return known[dev] == 1;
+}
+
 bool dense_tc_supported(int t, int n_in) noexcept {
-    return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42 || t == 8);
+    return dense_tc_device_ok() && n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42 || t == 8);
 }
 
 bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
+    if (!dense_tc_device_ok()) return false;   // sm_90 and later only
     if (t == 21) return n_in > 0 && n_in % 512 == 0 && n_out > 0 && one_ok<21>(w, n_in, n_out);
     return dense_tc_supported(t, n_in);
 }
@@ -1145,10 +1157,11 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 }
 
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
+    if (!dense_tc_device_ok()) return false;   // sm_90 and later only
     auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42 || t == 8; };
     if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
     const int tb = 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
-    return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
+    return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= basalt::volta::smem_ceiling(99 * 1024);
 }
 
 void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const void* w1, float* y1, int n_out1,
@@ -1169,7 +1182,7 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
             dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
             dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>};
         for (auto k : pair_kernels)
-            opt_in_check(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
+            opt_in_check(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, basalt::volta::smem_ceiling(99 * 1024)),
                          "dense_tc_pair");
         attr[dev].store(true, std::memory_order_release);
     }
@@ -1181,7 +1194,7 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
                    : (xr ? dense_tc_pair_kernel<true, false, false> : dense_tc_pair_kernel<false, false, false>);
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, smem);
-    if (xr && (g_pair & 4) && occ == 1 && smem + 4096 <= 99 * 1024) {
+    if (xr && (g_pair & 4) && occ == 1 && smem + 4096 <= basalt::volta::smem_ceiling(99 * 1024)) {
         kern = lq ? dense_tc_pair_kernel<true, true, true> : dense_tc_pair_kernel<true, true, false>;
         smem += 4096;
     }
@@ -1205,7 +1218,7 @@ void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
 
 int dense_tc_pair_mask() { return g_pair; }
 
-int dense_tc_mask() { return 29; }   // DEC_DTC 1 | 4 | 8 | 16 (see src/core/verify/)
+int dense_tc_mask() { return dense_tc_device_ok() ? 29 : 0; }   // 0 below sm_90   // DEC_DTC 1 | 4 | 8 | 16 (see src/core/verify/)
 
 #endif
 }  // namespace basalt::kernels

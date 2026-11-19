@@ -61,6 +61,10 @@ bool dec_gdn_rec_supported(int n_embd);
 /// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head (of the
 /// head map's value heads when a.nk > 0).
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream);
+/// Whether the current card has thread-block clusters (compute 9.0 and up). Without them, dec_gdn_rec runs
+/// dec_gdn_rec_split then dec_gdn_rec_norm (the same bits) and needs a.o; dec_gdn_rec_seg exits with an error (the caller
+/// runs dec_gdn_gates then dec_gdn_rec_seg_split instead).
+bool dec_gdn_clusters();
 
 /// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table
 /// has one entry per window row (a segment's rows all carry the segment's fields), uploaded to the device per window.

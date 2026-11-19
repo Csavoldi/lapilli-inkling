@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 #include <future>
+#include <cstdlib>   // std::getenv
 
 namespace basalt::prefill {
 using namespace detail;
@@ -40,6 +41,52 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
         }
         cudaEventRecord(m.cpu_ev_in, m.cs);
         cudaStreamWaitEvent(m.cpu_s, m.cpu_ev_in, 0);
+        cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cpu_s);
+        cudaEventRecord(m.cpu_ev_x, m.cpu_s);
+    }
+    return true;
+}
+
+// BASALT_CPU_X_LATE, read once: see experts.hpp
+bool cpu_late_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BASALT_CPU_X_LATE");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
+// at the routing read: only the point the activations are ready at (the copy itself waits for the CPU's experts)
+bool Prefill::Run::Chunk::Experts::Group::cpu_mark() {
+    if (cpu_maybe) {
+        if (m.cpu_s == nullptr) {
+            cudaStreamCreateWithFlags(&m.cpu_s, cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&m.cpu_ev_in, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&m.cpu_ev_x, cudaEventDisableTiming);
+            cudaEventCreate(&m.cpu_gev[0]);
+            cudaEventCreate(&m.cpu_gev[1]);
+        }
+        cudaEventRecord(m.cpu_ev_in, m.cs);
+    }
+    return true;
+}
+
+// once the CPU's experts are known and the peer's activations are on their way: the layer's activations, if the CPU takes any
+bool Prefill::Run::Chunk::Experts::Group::cpu_download_late() {
+    if (cpu_maybe && rows_cpu > 0) {
+        const size_t want = (size_t) T * N;
+        if (m.cpu_x_n < want) {
+            if (m.cpu_x) cudaFreeHost(m.cpu_x);
+            m.cpu_x = nullptr;
+            m.cpu_x_n = 0;
+            if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                err = "prefill: cannot allocate the CPU experts' activations";
+                return false;
+            }
+            m.cpu_x_n = want;
+        }
+        cudaStreamWaitEvent(m.cpu_s, m.cpu_ev_in, 0);
+        if (peer_now && ppc != nullptr && ppc->share) ppc->share->wait_activations(m.cpu_s);
         cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cpu_s);
         cudaEventRecord(m.cpu_ev_x, m.cpu_s);
     }

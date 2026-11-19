@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
@@ -60,8 +61,34 @@ static PeerShare::Dims share_dims(int64_t Tp, int64_t G, int64_t tf, const MmqPl
     d.launch_experts = MMQ_GROUP;
     d.launch_rows = G;
     // one group buffer, as many as its own gathers had: the group's gather follows the last group's products
-    d.stage_bufs = 1;
+    // Default: two group buffers, so the next group's gather runs during this group's products (with one, they run in
+    // series: ~4 ms a layer on 2x V100); BASALT_PEER_STAGE_BUFS (1 to 3) sets the count
+    static const int stage_bufs = [] {
+        const char* e = std::getenv("BASALT_PEER_STAGE_BUFS");
+        const int v = e != nullptr ? std::atoi(e) : 2;
+        return v >= 1 && v <= 3 ? v : 2;
+    }();
+    d.stage_bufs = stage_bufs;
     d.bufs = 2;
+    // the peer sums its rows per token (the MMQ share; the FP4 one keeps its rows); BASALT_PEER_COMBINE=0 keeps the rows
+    // (and only their buffers), to compare
+    static const bool combine_on = [] {
+        const char* e = std::getenv("BASALT_PEER_COMBINE");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    d.combine = tf == 0 && combine_on;
+    // the sums as FP16 rows with a power-of-two scale per row; BASALT_PEER_SUMS16=0 keeps them FP32
+    static const bool sums16_on = [] {
+        const char* e = std::getenv("BASALT_PEER_SUMS16");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    d.sums16 = d.combine && sums16_on;
+    // a launch's rows summed in one kernel; BASALT_PEER_ACC_FUSED=0 keeps one kernel per expert
+    static const bool acc_fused_on = [] {
+        const char* e = std::getenv("BASALT_PEER_ACC_FUSED");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    d.acc_fused = d.combine && acc_fused_on;
     return d;
 }
 template <class Take>

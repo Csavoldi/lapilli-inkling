@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 // `ushort` comes from the POSIX sys/types.h where there is one; redeclaring the same type is harmless.
 using ushort = unsigned short;
@@ -79,13 +80,13 @@ __device__ __forceinline__ int head_of_lane(int lane) {
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+    basalt::volta::cp_async_cg16(s, gmem);
 }
 __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(s), "l"(gmem));
+    basalt::volta::cp_async_ca<8>(s, gmem);
 }
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::); }
+__device__ __forceinline__ void cp_async_wait_all() { (basalt::volta::cp_async_commit(), basalt::volta::cp_async_wait<0>()); }
 
 // shared memory of one chunk block; KV_MODE 0: fp16 rows, 1: int8 rows + fp16 scales
 template <int KV_MODE> struct ChunkSmem {
@@ -425,12 +426,10 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 __device__ __forceinline__ void mma_16816(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_f16(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b0, b1, d[0], d[1], d[2], d[3]);
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_async_commit() { basalt::volta::cp_async_commit(); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { basalt::volta::cp_async_wait<N>(); }
 
 __global__ void __launch_bounds__(DTHREADS) draft_attn_chunk(AttnArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];

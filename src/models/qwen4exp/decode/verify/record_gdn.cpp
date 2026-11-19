@@ -44,7 +44,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
         ra.k0 = 0; ra.nk = v_.gs_nk0_; ra.qkv_out = qkv;
-        dec_gdn_rec(ra, n, cs);
+        { if (!ra.o && !dec_gdn_clusters()) ra.o = v_.y_; dec_gdn_rec(ra, n, cs); }
         dense_proj(4, GL.to, GL.wo0, v_.xq_, v_.bo_, Z0, (int) N, n, cs);
         goto gdn_done;
     }
@@ -56,8 +56,17 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
                          ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
     const int gdnf = ((!v_.batch_rec_ || pair_ok) && N == 2560 && n <= kVerifyMaxT) ? dec_gdnf_mode() : 0;
     auto rec = [&](const DecRecArgs& ra) {
-        if (v_.batch_rec_) dec_gdn_rec_seg(ra, v_.segb_, (size_t) gi * gdn_floats, n, n, cs);
-        else dec_gdn_rec(ra, n, cs);
+        if (v_.batch_rec_ && !dec_gdn_clusters()) {   // no thread-block clusters: the gates, then the cluster-free recurrence
+            DecRecArgs r2 = ra;
+            r2.o = v_.y_;
+            dec_gdn_gates(r2, n, v_.vgab_, cs);
+            dec_gdn_rec_seg_split(r2, v_.segb_, (size_t) gi * gdn_floats, n, n, n, cs, nullptr, 0, 0, v_.vgab_);
+        } else if (v_.batch_rec_) dec_gdn_rec_seg(ra, v_.segb_, (size_t) gi * gdn_floats, n, n, cs);
+        else if (!ra.o && !dec_gdn_clusters()) {   // ra is read-only here: set o on a copy
+            DecRecArgs r2 = ra;
+            r2.o = v_.y_;
+            dec_gdn_rec(r2, n, cs);
+        } else dec_gdn_rec(ra, n, cs);
     };
     const bool gdnf_fork = gdnf >= 2 && v_.sh_cs_ != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
     auto gdnf_z_side = [&] {
@@ -116,7 +125,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         for (int i = 3; i <= 5; ++i) stamp(l, i);
         {
             PdlScope pr(pdl, true);   // after the join
-            dec_gdn_rec(ra, n, cs);
+            { if (!ra.o && !dec_gdn_clusters()) ra.o = v_.y_; dec_gdn_rec(ra, n, cs); }
         }
         stamp(l, 6);
         dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
@@ -146,7 +155,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         } else {
             dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
             for (int i = 3; i <= 5; ++i) stamp(l, i);
-            dec_gdn_rec(ra, n, cs);
+            { if (!ra.o && !dec_gdn_clusters()) ra.o = v_.y_; dec_gdn_rec(ra, n, cs); }
             stamp(l, 6);
             dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
         }

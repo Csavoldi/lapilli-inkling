@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -66,6 +67,19 @@ struct PeerShare::Impl {
     void* xq[kMaxBufs] = {};
     void* hq = nullptr;
     float *gu = nullptr, *h = nullptr, *out[kMaxBufs] = {};
+    void* act_dev = nullptr;                // second card: a copy of the layer's activations
+    // the per-token sums' accumulator and the rows' weights (second card), its mapped copy and the weight tables (host),
+    // and their order: sums done (second card), sums copied out (second card), sums read by the main card
+    float *acc = nullptr, *w_dev = nullptr, *hacc = nullptr, *w_h[2] = {};
+    cudaEvent_t ev_acc = nullptr, ev_acc_out = nullptr, ev_hacc_free = nullptr;
+    void* acc16 = nullptr;   // the sums as FP16 rows, then one float scale a row (second card)
+    // per launch, the tokens it touches and their rows in expert order (CSR), on the card and in two host sets
+    int32_t *csr_dev = nullptr, *csr_h[2] = {};
+    std::vector<int32_t> csr_cnt, csr_pos;   // the worker's scratch, one entry a token
+    // the activations send_activations sent for the next run
+    bool sent = false;
+    int sent_tokens = 0, sent_type = -1;
+    const float* sent_x = nullptr;
     int32_t *ident = nullptr, *tok_dev = nullptr, *bounds_dev = nullptr;
     std::unique_ptr<mmq::Context> ctx;
     // pinned, portable; the activations mapped too
@@ -191,6 +205,8 @@ struct PeerShare::Impl {
                     cudaStreamDestroy(s);
                 }
             if (ev_xin) cudaEventDestroy(ev_xin);
+            for (cudaEvent_t e : {ev_acc, ev_acc_out})
+                if (e) cudaEventDestroy(e);
             for (int b = 0; b < kMaxBufs; ++b)
                 for (cudaEvent_t e : {ev_staged[b], ev_free[b], ev_done[b], ev_out[b]})
                     if (e) cudaEventDestroy(e);
@@ -204,7 +220,7 @@ struct PeerShare::Impl {
                     cudaStreamSynchronize(s);
                     cudaStreamDestroy(s);
                 }
-            for (cudaEvent_t e : {ev_x, ev_xq, ev_end})
+            for (cudaEvent_t e : {ev_x, ev_xq, ev_end, ev_hacc_free})
                 if (e) cudaEventDestroy(e);
             for (cudaEvent_t e : ev_rows)
                 if (e) cudaEventDestroy(e);
@@ -232,11 +248,23 @@ static void layout(const PeerShare::Dims& d, Peer&& peer, Host&& host) {
     peer((size_t) R * (size_t) d.n_ff * 4);                          // h
     peer(mmq::q8_bytes(R, d.n_ff));                                  // hq
     peer((size_t) R * 4);                                            // ident
+    peer(d.act_bytes);                                               // act_dev
+    if (d.combine) {
+        peer((size_t) d.max_tokens * (size_t) d.n_embd * 4);         // acc
+        peer((size_t) d.max_rows * 4);                               // w_dev
+        if (d.sums16) peer((size_t) d.max_tokens * ((size_t) d.n_embd * 2 + 4));   // acc16
+        peer((size_t) (3 * d.max_rows + 16) * 4);   // csr_dev (whether acc_fused or not)
+    }
     peer((size_t) d.max_rows * 4);                                   // tok
     peer((size_t) G * (size_t) (d.launch_experts + 1) * 4);          // bounds
     for (int s = 0; s < 2; ++s) {
         host((size_t) d.max_rows * 4);                               // tok
         host((size_t) G * (size_t) (d.launch_experts + 1) * 4);      // bounds
+    }
+    if (d.combine) {
+        host((size_t) d.max_tokens * (size_t) d.n_embd * 4);         // hacc
+        for (int s = 0; s < 2; ++s) host((size_t) d.max_rows * 4);   // w_h
+        for (int s = 0; s < 2; ++s) host((size_t) (3 * d.max_rows + 16) * 4);   // csr_h (whether acc_fused or not)
     }
 }
 
@@ -259,6 +287,10 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
     }
     auto m = std::make_unique<Impl>();
     m->d = d;
+    if (d.combine) {
+        m->csr_cnt.assign((size_t) d.max_tokens, 0);
+        m->csr_pos.assign((size_t) d.max_tokens, 0);
+    }
     bool ok = true;
     std::vector<void*> pv, hv;
     {
@@ -272,7 +304,9 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
         ok = ok && cudaStreamCreateWithFlags(&m->s_stage, cudaStreamNonBlocking) == cudaSuccess &&
              cudaStreamCreateWithFlags(&m->s_prod, cudaStreamNonBlocking) == cudaSuccess &&
              cudaStreamCreateWithFlags(&m->s_out, cudaStreamNonBlocking) == cudaSuccess &&
-             cudaEventCreateWithFlags(&m->ev_xin, cudaEventDisableTiming) == cudaSuccess;
+             cudaEventCreateWithFlags(&m->ev_xin, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_acc, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_acc_out, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < kMaxBufs; ++b)
             for (cudaEvent_t* e : {&m->ev_staged[b], &m->ev_free[b], &m->ev_done[b], &m->ev_out[b]})
                 ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
@@ -287,6 +321,13 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
             m->h = (float*) pv[i++];
             m->hq = pv[i++];
             m->ident = (int32_t*) pv[i++];
+            m->act_dev = pv[i++];
+            if (d.combine) {
+                m->acc = (float*) pv[i++];
+                m->w_dev = (float*) pv[i++];
+                if (d.sums16) m->acc16 = pv[i++];
+                m->csr_dev = (int32_t*) pv[i++];
+            }
             m->tok_dev = (int32_t*) pv[i++];
             m->bounds_dev = (int32_t*) pv[i++];
             m->ctx = std::make_unique<mmq::Context>();
@@ -303,7 +344,8 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
              cudaStreamCreateWithPriority(&m->s_rows, cudaStreamNonBlocking, hi) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_x, cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_xq, cudaEventDisableTiming) == cudaSuccess &&
-             cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess;
+             cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_hacc_free, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < kMaxBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
         ok = ok && cudaMalloc(&m->dxq, mmq::q8_bytes(kQuantRows, d.n_embd)) == cudaSuccess;
         layout(d, [](size_t) {}, [&](size_t b) {
@@ -319,6 +361,11 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
             for (int s = 0; s < 2; ++s) {
                 m->tok_h[s] = (int32_t*) hv[i++];
                 m->bounds_h[s] = (int32_t*) hv[i++];
+            }
+            if (d.combine) {
+                m->hacc = (float*) hv[i++];
+                for (int s = 0; s < 2; ++s) m->w_h[s] = (float*) hv[i++];
+                for (int s = 0; s < 2; ++s) m->csr_h[s] = (int32_t*) hv[i++];
             }
         }
     }
@@ -368,11 +415,19 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             err = "peer share: the experts differ from the prepared ones";
             return false;
         }
+    if (d.combine)   // each row needs its weight
+        for (const Expert& e : experts)
+            if (e.n > 0 && e.w == nullptr) {
+                err = "peer share: the sums need each row's weight";
+                return false;
+            }
     // the groups and their launches: this layer's table set, rows launch by launch in expert order
     const int s = m.set;
     m.set ^= 1;
     int32_t* tok = m.tok_h[s];
     int32_t* bounds = m.bounds_h[s];
+    float* wt = d.combine ? m.w_h[s] : nullptr;
+    int32_t* csr = d.acc_fused ? m.csr_h[s] : nullptr;
     struct Cut {
         int64_t r0 = 0, rows = 0, max_rows = 0;
         int b0 = 0, q0 = 0, n = 0;                    // its bounds in the table; its first expert in the group and how many
@@ -409,6 +464,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 return false;
             }
             std::copy_n(e.tok + k0, take, tok + r);
+            if (wt) std::copy_n(e.w + k0, take, wt + r);
             r += take;
             l.rows += take;
             l.max_rows = std::max<int64_t>(l.max_rows, take);
@@ -427,11 +483,16 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         }
         groups.push_back(std::move(g));
     }
+    // the activations already sent by send_activations (the same bytes), if they are these
+    const bool sent = m.sent && m.sent_x == x && m.sent_tokens == n_tokens && m.sent_type == L.gu_type && !L.quantize &&
+                      !L.products;
+    m.sent = false;
     if (r > 0) {   // the layer's activations into mapped host memory, once the second card has read the last layer's
         const core::OnDevice od(m.main);
         cudaEventRecord(m.ev_x, (cudaStream_t) main_stream);
         cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
+        if (!sent) {   // unless send_activations sent them
         cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
         if (L.quantize) {
             L.quantize(x, n_tokens, m.hxq, m.s_main);
@@ -447,6 +508,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             }
         }
         cudaEventRecord(m.ev_xq, m.s_main);
+        }   // if (!sent)
     }
     // the group numbers: the prepared ones, then new ones
     std::vector<uint64_t> nums;
@@ -459,7 +521,14 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             for (size_t i = groups[gi].i0; i < groups[gi].i1; ++i) blobs[gi].emplace_back(experts[i].blob, experts[i].on_peer);
     }
     Impl* w = &m;
-    m.post([w, L, n_tokens, dst, r, nb, tok, bounds, prepared, groups = std::move(groups), nums = std::move(nums),
+    // the activations' copy to the second card, on the MMQ path only (the FP4 path already copies them once);
+    // BASALT_PEER_ACT_COPY=0 keeps upstream's row-by-row reads from mapped host memory
+    static const bool act_copy_on = [] {
+        const char* e = std::getenv("BASALT_PEER_ACT_COPY");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    const bool act_copy = act_copy_on && !L.quantize && !L.products;
+    m.post([w, L, n_tokens, dst, r, nb, tok, bounds, wt, csr, prepared, act_copy, sent, groups = std::move(groups), nums = std::move(nums),
             blobs = std::move(blobs), all_blobs = std::move(all_blobs)] {
         Impl& m = *w;
         const Dims& d = m.d;
@@ -468,8 +537,50 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             const core::OnDevice od(m.peer);
             cudaMemcpyAsync(m.tok_dev, tok, (size_t) r * 4, cudaMemcpyHostToDevice, ps);
             cudaMemcpyAsync(m.bounds_dev, bounds, (size_t) nb * 4, cudaMemcpyHostToDevice, ps);
+            if (d.combine) {   // the weights, and the accumulator zeroed once the previous sums are copied out
+                cudaMemcpyAsync(m.w_dev, wt, (size_t) r * 4, cudaMemcpyHostToDevice, ps);
+                cudaStreamWaitEvent(ps, m.ev_acc_out, 0);
+                cudaMemsetAsync(m.acc, 0, (size_t) n_tokens * (size_t) d.n_embd * 4, ps);
+            }
             cudaStreamWaitEvent(ps, m.ev_xq, 0);
+            if (act_copy && !sent) {   // the layer's activations in one copy, then gathered on the card (unless already sent)
+                const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
+                const size_t bb = (mmq::q8_bytes(1, d.n_embd) - mmq::q8_bytes(0, d.n_embd)) / kb;   // one block
+                cudaMemcpyAsync(m.act_dev, m.hxq, (size_t) n_tokens * bb * kb, cudaMemcpyHostToDevice, ps);
+            }
         }
+        // each launch's tokens and their rows in expert order (CSR), copied once for the layer
+        std::vector<std::pair<int32_t, int32_t>> csr_of;   // per launch, in issue order: its first token entry and how many
+        if (csr != nullptr && r > 0) {
+            const int64_t cap = d.max_rows;
+            int32_t* ut = csr;
+            int32_t* of = csr + cap;
+            int32_t* ix = csr + 2 * cap + 1;
+            int32_t nu = 0, nk = 0;
+            for (const Group& g : groups)
+                for (const Cut& l : g.launches) {
+                    const int32_t u0 = nu;
+                    for (int64_t rr = 0; rr < l.rows; ++rr) {
+                        const int32_t t = tok[l.r0 + rr];
+                        if (m.csr_cnt[(size_t) t]++ == 0) ut[nu++] = t;
+                    }
+                    for (int32_t u = u0; u < nu; ++u) {
+                        const int32_t t = ut[u];
+                        of[u] = nk;
+                        m.csr_pos[(size_t) t] = nk;
+                        nk += m.csr_cnt[(size_t) t];
+                    }
+                    for (int64_t rr = 0; rr < l.rows; ++rr) ix[m.csr_pos[(size_t) tok[l.r0 + rr]]++] = (int32_t) rr;
+                    for (int32_t u = u0; u < nu; ++u) m.csr_cnt[(size_t) ut[u]] = 0;
+                    csr_of.emplace_back(u0, nu - u0);
+                }
+            of[nu] = nk;
+            const core::OnDevice od(m.peer);
+            cudaMemcpyAsync(m.csr_dev, ut, (size_t) nu * 4, cudaMemcpyHostToDevice, ps);
+            cudaMemcpyAsync(m.csr_dev + cap, of, (size_t) (nu + 1) * 4, cudaMemcpyHostToDevice, ps);
+            cudaMemcpyAsync(m.csr_dev + 2 * cap + 1, ix, (size_t) nk * 4, cudaMemcpyHostToDevice, ps);
+        }
+        size_t launch_k = 0;   // the launch being issued (csr_of)
         bool first = true;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const Group& g = groups[gi];
@@ -489,7 +600,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 lv.bounds_host = bounds + l.b0;
                 lv.rows = l.rows;
                 lv.max_rows = l.max_rows;
-                lv.act = m.hxq;
+                lv.act = act_copy ? m.act_dev : m.hxq;
                 lv.n_tokens = n_tokens;
                 lv.first = first;
                 lv.out = m.out[b];
@@ -501,6 +612,22 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                     m.products(L, lv, b, ps);
                 }
                 cudaEventRecord(m.ev_done[b], ps);
+                if (d.combine) {   // each expert's rows into the sums, in order, on this stream
+                    if (csr != nullptr) {   // one kernel, each token's rows in expert order
+                        const std::pair<int32_t, int32_t> cu = csr_of[launch_k];
+                        kernels::accumulate_rows_csr(m.acc, m.out[b], m.w_dev + l.r0, m.csr_dev + cu.first,
+                                                     m.csr_dev + d.max_rows + cu.first, m.csr_dev + 2 * d.max_rows + 1,
+                                                     cu.second, d.n_embd, ps);
+                    } else {
+                        for (int q = 0; q < l.n; ++q) {
+                            const int32_t a = lv.bounds_host[q], z = lv.bounds_host[q + 1];
+                            kernels::accumulate_rows(m.acc, m.out[b] + (size_t) a * (size_t) d.n_embd, m.w_dev + l.r0 + a,
+                                                     m.tok_dev + l.r0 + a, (int64_t) (z - a), d.n_embd, ps);
+                        }
+                    }
+                    ++launch_k;
+                    continue;
+                }
                 // the rows out, once the main card has copied the last ones from there
                 const size_t bytes = (size_t) l.rows * (size_t) d.n_embd * 4;
                 cudaStreamWaitEvent(so, m.ev_done[b], 0);
@@ -516,6 +643,30 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             if (g.launches.empty()) cudaEventRecord(m.ev_free[sb], m.s_stage);
             else cudaEventRecord(m.ev_free[sb], ps);
         }
+        if (d.combine && r > 0) {   // the sums, once a layer, into dst on the main card
+            const core::OnDevice op(m.peer);
+            // with sums16, the sums as FP16 rows (a power of two a row), half the bytes on the link
+            const size_t half_bytes = (size_t) n_tokens * (size_t) d.n_embd * 2;
+            if (d.sums16)
+                kernels::rows_to_f16_scaled(m.acc, (uint16_t*) m.acc16, (float*) ((uint8_t*) m.acc16 + half_bytes), n_tokens,
+                                            d.n_embd, ps);
+            cudaEventRecord(m.ev_acc, ps);
+            cudaStreamWaitEvent(so, m.ev_acc, 0);
+            cudaStreamWaitEvent(so, m.ev_hacc_free, 0);   // the main card has read the previous sums
+            if (d.sums16)
+                cudaMemcpyAsync(m.hacc, m.acc16, half_bytes + (size_t) n_tokens * 4, cudaMemcpyDeviceToHost, so);
+            else
+                cudaMemcpyAsync(m.hacc, m.acc, (size_t) n_tokens * (size_t) d.n_embd * 4, cudaMemcpyDeviceToHost, so);
+            cudaEventRecord(m.ev_acc_out, so);
+            const core::OnDevice om(m.main);
+            cudaStreamWaitEvent(mr, m.ev_acc_out, 0);
+            if (d.sums16)
+                kernels::rows_from_f16_scaled_mapped(dst, m.hacc, (const float*) ((const uint8_t*) m.hacc + half_bytes), n_tokens,
+                                                     d.n_embd, mr);
+            else
+                kernels::copy_from_mapped(dst, m.hacc, (int64_t) n_tokens * d.n_embd, mr);
+            cudaEventRecord(m.ev_hacc_free, mr);
+        }
         {   // the activations' host buffer is free once the layer's gathers are done
             const core::OnDevice op(m.peer);
             cudaEventRecord(m.ev_xin, ps);
@@ -525,6 +676,56 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         m.err = cudaGetLastError();
     });
     return true;
+}
+
+// see peer_share.hpp
+bool PeerShare::send_activations(int gu_type, const float* x, int n_tokens, void* main_stream) {
+    static const bool on = [] {
+        const char* e = std::getenv("BASALT_PEER_EARLY_ACT");
+        const char* c = std::getenv("BASALT_PEER_ACT_COPY");
+        return !(e != nullptr && e[0] == '0') && !(c != nullptr && c[0] == '0');
+    }();
+    if (m_ == nullptr || !on) return false;
+    Impl& m = *m_;
+    const Dims& d = m.d;
+    if (n_tokens <= 0 || n_tokens > d.max_tokens) return false;
+    const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
+    const size_t bb = (mmq::q8_bytes(1, d.n_embd) - mmq::q8_bytes(0, d.n_embd)) / kb;   // one block
+    {
+        const core::OnDevice od(m.main);
+        cudaEventRecord(m.ev_x, (cudaStream_t) main_stream);
+        cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
+        cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);   // the second card has copied the last layer's
+        for (int64_t r0 = 0; r0 < n_tokens; r0 += kQuantRows) {
+            const int64_t nr = std::min<int64_t>(kQuantRows, n_tokens - r0);
+            mmq::quantize(x + (size_t) r0 * (size_t) d.n_embd, nullptr, m.dxq, gu_type, d.n_embd, d.n_embd, nr, m.s_main);
+            cudaMemcpy2DAsync((uint8_t*) m.hxq + (size_t) r0 * bb, (size_t) n_tokens * bb, m.dxq, (size_t) nr * bb,
+                              (size_t) nr * bb, kb, cudaMemcpyDeviceToHost, m.s_main);
+        }
+        cudaEventRecord(m.ev_xq, m.s_main);
+    }
+    m.sent = true;
+    m.sent_x = x;
+    m.sent_tokens = n_tokens;
+    m.sent_type = gu_type;
+    Impl* w = &m;
+    const size_t bytes = (size_t) n_tokens * bb * kb;
+    m.post([w, bytes] {   // on the second card as soon as they are on the host; its products read act_dev
+        Impl& m = *w;
+        const core::OnDevice od(m.peer);
+        cudaStreamWaitEvent(m.s_prod, m.ev_xq, 0);
+        cudaMemcpyAsync(m.act_dev, m.hxq, bytes, cudaMemcpyHostToDevice, m.s_prod);
+        cudaEventRecord(m.ev_xin, m.s_prod);   // the host copy is free again
+    });
+    return true;
+}
+
+bool PeerShare::combines() const { return m_ != nullptr && m_->d.combine; }
+
+void PeerShare::wait_activations(void* stream) const {
+    if (m_ == nullptr) return;
+    const core::OnDevice od(m_->main);
+    cudaStreamWaitEvent((cudaStream_t) stream, m_->ev_xq, 0);
 }
 
 bool PeerShare::join(void* stream, std::string& err) {

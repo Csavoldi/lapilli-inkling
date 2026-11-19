@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <mutex>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::prefill::fused {
 namespace {
@@ -169,20 +170,16 @@ __global__ void place_kernel(const int32_t* __restrict__ ids, int64_t n, int k, 
 // ---- the expert products
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
-                 "l"(src));
+    basalt::volta::cp_async_cg16((unsigned) __cvta_generic_to_shared(dst), src);
 }
 __device__ __forceinline__ void cp4(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
-                 "l"(src));
+    basalt::volta::cp_async_ca<4>((unsigned) __cvta_generic_to_shared(dst), src);
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_commit() { basalt::volta::cp_async_commit(); }
+template <int N> __device__ __forceinline__ void cp_wait() { basalt::volta::cp_async_wait<N>(); }
 // d = A (16 x 32 s8, row) * B (32 x 8 s8, col), int32, from zero
 __device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    basalt::volta::mma_16832_s32_s8<false>(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b0, b1, 0, 0, 0, 0);
 }
 #endif
 

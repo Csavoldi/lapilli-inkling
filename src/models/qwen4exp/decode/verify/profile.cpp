@@ -24,7 +24,8 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "  hc1 read",
+                                          "  router"};   // 31, 32 (17 then holds what remains: the plan)
     std::string out;
     char b[80];
     double total = 0;
@@ -274,6 +275,14 @@ void Verifier::collect_profile() {
             prof_sum_[kind][28] += dd;      //           down
             prof_sum_[kind][29] += du;      //           up (through both halves, as before)
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
+        }
+        {   // hc-read1+router split in three (read, router, plan) when both marks exist
+            const double r1 = gap(at(l, 31), at(l, 16)), rt = gap(at(l, 32), at(l, 31)), pl = gap(at(l, 17), at(l, 32));
+            if (r1 > 0 && rt > 0 && pl > 0) {
+                prof_sum_[kind][31] += r1;
+                prof_sum_[kind][32] += rt;
+                prof_sum_[kind][17] -= r1 + rt;   // what remains of 17: the plan (dec_moe_route) and its forks
+            }
         }
     }
     prof_sum_[0][26] += gap(at(L, 1), at(L, 0));

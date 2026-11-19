@@ -5,6 +5,9 @@
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/log.hpp"
+#include <cuda_runtime.h>
+#include <atomic>
+#include <cstdlib>
 #include <string>
 
 namespace basalt::prefill {
@@ -13,9 +16,38 @@ using namespace detail;
 namespace detail {
 // The hc up product and the mix: one kernel from kUpMixMinT tokens up (the gate rows never reach memory), else the
 // product into `gated` and gr_mix_r.  The same bits either way.
+// BASALT_UP_MIX=0 always takes the cuBLAS product then gr_mix_r, BASALT_UP_MIX=1 always the fused kernel. Unset, a V100
+// (sm_70 to sm_74) takes cuBLAS then gr_mix_r, since the fused kernel is emulated there (measured: prompt read 14% faster
+// at 3000 tokens, 27% at 16000); other cards keep the fused kernel.
+// The variable is read once, the compute capability once per card.
+static bool up_mix_fused_allowed() {
+    static const int force = [] {
+        const char* e = std::getenv("BASALT_UP_MIX");
+        return e == nullptr ? -1 : (e[0] == '0' ? 0 : 1);
+    }();
+    if (force >= 0) return force == 1;
+    static std::atomic<int> cc[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return true;
+    }
+    int c = cc[dev].load(std::memory_order_acquire);
+    if (c == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return true;
+        }
+        c = 10 * major + minor;
+        cc[dev].store(c, std::memory_order_release);
+    }
+    return !(c >= 70 && c < 75);
+}
 void up_mix(Gemm& gm, const uint16_t* w_up, const uint16_t* lo16, float* gated, const float* R, const float* rs,
             const float* w_norm, float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
-    const uint16_t* w = T >= kUpMixMinT ? gm.bf16_rows(w_up, D, LR) : nullptr;
+    const uint16_t* w = T >= kUpMixMinT && up_mix_fused_allowed() ? gm.bf16_rows(w_up, D, LR) : nullptr;
     if (w != nullptr && gr_up_mix(lo16, w, R, rs, w_norm, mixed, mixed16, T, stream, mixed_h)) return;
     gm.bf16_w(lo16, w_up, gated, T, D, LR);
     gr_mix_r(R, rs, w_norm, gated, mixed, mixed16, T, stream, mixed_h);

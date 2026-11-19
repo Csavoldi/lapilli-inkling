@@ -264,6 +264,137 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
                                                                                   width / 4, hit_rows, count);
 }
+// See elementwise.hpp (an expert's rows have distinct tokens: one writer per element)
+__global__ void accumulate_rows_kernel(float4* __restrict__ acc, const float4* __restrict__ rows, const float* __restrict__ w,
+                                       const int32_t* __restrict__ tok, int64_t n, int64_t row4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n * row4; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t r = i / row4, c = i % row4;
+        const float a = w[r];
+        const float4 v = rows[i];
+        float4 s = acc[(int64_t) tok[r] * row4 + c];
+        s.x = fmaf(a, v.x, s.x);
+        s.y = fmaf(a, v.y, s.y);
+        s.z = fmaf(a, v.z, s.z);
+        s.w = fmaf(a, v.w, s.w);
+        acc[(int64_t) tok[r] * row4 + c] = s;
+    }
+}
+
+void accumulate_rows(float* acc, const float* rows, const float* w, const int32_t* tok, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) acc & 15) != 0 || ((uintptr_t) rows & 15) != 0) {
+        basalt::log::error("basalt", "accumulate_rows: width must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    const int64_t row4 = width / 4, total = n * row4;
+    const int blocks = (int) ((total + 255) / 256 < 1024 ? (total + 255) / 256 : 1024);
+    accumulate_rows_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) acc, (const float4*) rows, w, tok, n, row4);
+    check_launch("accumulate_rows");
+}
+
+// See elementwise.hpp (the second card's per-token sums as FP16, a power of two per row)
+__global__ void rows_to_f16_scaled_kernel(const float* __restrict__ acc, uint16_t* __restrict__ out, float* __restrict__ scale,
+                                          int64_t width) {
+    const int64_t r = blockIdx.x;
+    const float* a = acc + r * width;
+    float m = 0.0f;
+    for (int64_t c = threadIdx.x; c < width; c += blockDim.x) m = fmaxf(m, fabsf(a[c]));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __shared__ float part[32];
+    __shared__ float inv_sh;
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mm = 0.0f;
+        for (int w = 0; w < (int) ((blockDim.x + 31) >> 5); ++w) mm = fmaxf(mm, part[w]);
+        float s = 1.0f, inv = 1.0f;
+        if (mm > 0.0f && isfinite(mm)) {   // the row's largest |value| lands in [2^14, 2^15)
+            const int e = max(ilogbf(mm), -100);
+            s = ldexpf(1.0f, e - 14);
+            inv = ldexpf(1.0f, 14 - e);
+        }
+        scale[r] = s;
+        inv_sh = inv;
+    }
+    __syncthreads();
+    const float inv = inv_sh;
+    for (int64_t c = threadIdx.x; c < width; c += blockDim.x) out[r * width + c] = f16_from_f32(a[c] * inv);
+}
+
+__global__ void rows_from_f16_scaled_mapped_kernel(float4* __restrict__ dst, const volatile uint4* src, const volatile float* scale,
+                                                   int64_t width8) {
+    const int64_t r = blockIdx.x;
+    __shared__ float s_sh;
+    if (threadIdx.x == 0) s_sh = scale[r];
+    __syncthreads();
+    const float s = s_sh;
+    for (int64_t c = threadIdx.x; c < width8; c += blockDim.x) {
+        const uint4 v = const_cast<const uint4*>(src)[r * width8 + c];
+        float4 lo, hi;
+        lo.x = f32_from_f16((uint16_t) (v.x & 0xFFFFu)) * s;
+        lo.y = f32_from_f16((uint16_t) (v.x >> 16)) * s;
+        lo.z = f32_from_f16((uint16_t) (v.y & 0xFFFFu)) * s;
+        lo.w = f32_from_f16((uint16_t) (v.y >> 16)) * s;
+        hi.x = f32_from_f16((uint16_t) (v.z & 0xFFFFu)) * s;
+        hi.y = f32_from_f16((uint16_t) (v.z >> 16)) * s;
+        hi.z = f32_from_f16((uint16_t) (v.w & 0xFFFFu)) * s;
+        hi.w = f32_from_f16((uint16_t) (v.w >> 16)) * s;
+        dst[(r * width8 + c) * 2] = lo;
+        dst[(r * width8 + c) * 2 + 1] = hi;
+    }
+}
+
+void rows_to_f16_scaled(const float* acc, uint16_t* out, float* scale, int64_t rows, int64_t width, void* stream) {
+    if (rows <= 0) return;
+    rows_to_f16_scaled_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(acc, out, scale, width);
+    check_launch("rows_to_f16_scaled");
+}
+
+void rows_from_f16_scaled_mapped(float* dst, const void* src, const float* scale, int64_t rows, int64_t width, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 7) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "rows_from_f16_scaled_mapped: width must be a multiple of 8 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    rows_from_f16_scaled_mapped_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile uint4*) src, (const volatile float*) scale, width / 8);
+    check_launch("rows_from_f16_scaled_mapped");
+}
+
+// See elementwise.hpp (one block a token, its rows in expert order, the same fmaf chain as accumulate_rows)
+__global__ void accumulate_rows_csr_kernel(float4* __restrict__ acc, const float4* __restrict__ rows, const float* __restrict__ w,
+                                           const int32_t* __restrict__ utok, const int32_t* __restrict__ off,
+                                           const int32_t* __restrict__ idx, int64_t row4) {
+    const int64_t u = blockIdx.x;
+    const int64_t t = utok[u];
+    const int32_t k0 = off[u], k1 = off[u + 1];
+    for (int64_t c = threadIdx.x; c < row4; c += blockDim.x) {
+        float4 s = acc[t * row4 + c];
+        for (int32_t k = k0; k < k1; ++k) {
+            const int64_t r = idx[k];
+            const float a = w[r];
+            const float4 v = rows[r * row4 + c];
+            s.x = fmaf(a, v.x, s.x);
+            s.y = fmaf(a, v.y, s.y);
+            s.z = fmaf(a, v.z, s.z);
+            s.w = fmaf(a, v.w, s.w);
+        }
+        acc[t * row4 + c] = s;
+    }
+}
+
+void accumulate_rows_csr(float* acc, const float* rows, const float* w, const int32_t* utok, const int32_t* off,
+                         const int32_t* idx, int64_t n_tokens, int64_t width, void* stream) {
+    if (n_tokens <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) acc & 15) != 0 || ((uintptr_t) rows & 15) != 0) {
+        basalt::log::error("basalt", "accumulate_rows_csr: width must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    accumulate_rows_csr_kernel<<<(unsigned) n_tokens, 128, 0, (cudaStream_t) stream>>>((float4*) acc, (const float4*) rows, w,
+                                                                                        utok, off, idx, width / 4);
+    check_launch("accumulate_rows_csr");
+}
+
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {

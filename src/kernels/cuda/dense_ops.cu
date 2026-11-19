@@ -1,4 +1,5 @@
 // src/kernels/cuda/dense_ops.cu - see include/basalt/kernels/dense_ops.hpp.
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -114,7 +115,7 @@ __global__ void swiglu_scaled_kernel(const float* g, const float* u, const float
 constexpr int RD_T = 16, RD_N = 48;
 __device__ __forceinline__ unsigned tf32_of(float f) {
     unsigned r;
-    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(f));
+    (r = basalt::volta::cvt_rna_tf32(f));
     return r;
 }
 __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
@@ -136,12 +137,8 @@ __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restri
 #pragma unroll
         for (int j = 0; j < RD_N / 8; ++j) {
             const unsigned wv = *reinterpret_cast<const unsigned*>(wr[j] + k);
-            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                         : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
-                         : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
-            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                         : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
-                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+            basalt::volta::mma_1688_f32_tf32(acc[j][0], acc[j][1], acc[j][2], acc[j][3], l0, l1, l2, l3, wv << 16, wv & 0xFFFF0000u, acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
+            basalt::volta::mma_1688_f32_tf32(acc[j][0], acc[j][1], acc[j][2], acc[j][3], a0, a1, a2, a3, wv << 16, wv & 0xFFFF0000u, acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
         }
     }
 #pragma unroll
@@ -166,7 +163,7 @@ constexpr int GP_AHEAD = 1;   // K / GP_S must be a multiple of 32 GP_AHEAD
 constexpr int GP_HV = 48, GP_S = 8, GP_TT = 64, GP_LD = 2 * GP_HV + 8, GP_NF = 2 * GP_HV / 8;
 // In: FP32 x (two BF16 terms) or BF16 x (exact: one term)
 template <class In>
-__global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
+__global__ void BASALT_CLUSTER_DIMS(1, 1, GP_S) __launch_bounds__(128)
     gdn_gating_proj_kernel(const In* __restrict__ x, const uint16_t* __restrict__ w, const float* __restrict__ dt,
                            const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta, int64_t T,
                            int64_t K) {
@@ -221,9 +218,7 @@ __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
 #pragma unroll
                     for (int j = 0; j < GP_NF; ++j) {
                         const unsigned b0 = step ? wv[j].z : wv[j].x, b1 = step ? wv[j].w : wv[j].y;
-                        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                                     : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
-                                     : "r"(h0), "r"(h1), "r"(h2), "r"(h3), "r"(b0), "r"(b1));
+                        basalt::volta::mma_16816_f32_bf16(acc[j][0], acc[j][1], acc[j][2], acc[j][3], h0, h1, h2, h3, b0, b1, acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
                     }
                     continue;
                 }
@@ -238,12 +233,8 @@ __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
 #pragma unroll
                 for (int j = 0; j < GP_NF; ++j) {
                     const unsigned b0 = step ? wv[j].z : wv[j].x, b1 = step ? wv[j].w : wv[j].y;
-                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                                 : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
-                                 : "r"(lo0), "r"(lo1), "r"(lo2), "r"(lo3), "r"(b0), "r"(b1));
-                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                                 : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
-                                 : "r"(hi0), "r"(hi1), "r"(hi2), "r"(hi3), "r"(b0), "r"(b1));
+                    basalt::volta::mma_16816_f32_bf16(acc[j][0], acc[j][1], acc[j][2], acc[j][3], lo0, lo1, lo2, lo3, b0, b1, acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
+                    basalt::volta::mma_16816_f32_bf16(acc[j][0], acc[j][1], acc[j][2], acc[j][3], hi0, hi1, hi2, hi3, b0, b1, acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
                 }
             }
         }
@@ -253,7 +244,7 @@ __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
         *reinterpret_cast<float2*>(part + (warp * 16 + g) * GP_LD + 8 * j + 2 * c) = make_float2(acc[j][0], acc[j][1]);
         *reinterpret_cast<float2*>(part + (warp * 16 + g + 8) * GP_LD + 8 * j + 2 * c) = make_float2(acc[j][2], acc[j][3]);
     }
-    cg::cluster_group cluster = cg::this_cluster();
+    BASALT_CLUSTER_T cluster = BASALT_THIS_CLUSTER();
     cluster.sync();
     const float* remote[GP_S];
 #pragma unroll

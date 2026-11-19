@@ -86,6 +86,11 @@ uint64_t granularity() {
     return (uint64_t) g;
 }
 
+#if CUDA_VERSION < 12090   // CUDA 12.6 does not name attribute 141 yet
+#define BASALT_HOST_NUMA_VMM ((CUdevice_attribute) 141)
+#else
+#define BASALT_HOST_NUMA_VMM CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+#endif
 namespace {
 // Separate backing allocations avoid the driver's single-allocation limit while preserving one address range.
 constexpr uint64_t kHostPieceBytes = 2ull << 30;
@@ -95,7 +100,7 @@ bool host_prop(CUmemAllocationProp& prop, size_t& g) {
     int dev = 0, supported = 0, node = -1;
     CUdevice cu;
     if (!v.ok || cudaGetDevice(&dev) != cudaSuccess || v.device_get(&cu, dev) != CUDA_SUCCESS ||
-        v.attribute(&supported, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
+        v.attribute(&supported, BASALT_HOST_NUMA_VMM, cu) != CUDA_SUCCESS ||
         !supported || v.attribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cu) != CUDA_SUCCESS) return false;
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location = {CU_MEM_LOCATION_TYPE_HOST_NUMA, node < 0 ? 0 : node};

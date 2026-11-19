@@ -16,6 +16,7 @@
 // see THIRD_PARTY_LICENSES): weights staged before the PDL wait, dependents started once the weights are read.
 #pragma once
 
+#include "basalt/kernels/volta_sm100.hpp"
 #include "basalt/kernels/narrow_bf16.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/window_gemm.hpp"
@@ -23,6 +24,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels::wgemm::detail {
 
@@ -71,30 +73,27 @@ template <int F, int P> __device__ __forceinline__ int swz(int r) {
 
 template <int N> __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
-    if constexpr (N == 16) asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
-    else asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::"r"(s), "l"(gmem), "n"(N));
+    if constexpr (N == 16) basalt::volta::cp_async_cg16(s, gmem);
+    else basalt::volta::cp_async_ca<N>(s, gmem);
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_commit() { basalt::volta::cp_async_commit(); }
+template <int N> __device__ __forceinline__ void cp_wait() { basalt::volta::cp_async_wait<N>(); }
 
 __device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                     unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-                 "{%0, %1, %2, %3};"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_bf16(d[0], d[1], d[2], d[3], a0, a1, a2, a3, b0, b1, d[0], d[1], d[2], d[3]);
 }
 // two int8 (the low 16 bits of x, the low byte the lower half) as bf16x2, exact
 __device__ __forceinline__ unsigned s8x2_bf16(unsigned x) {
     const float f0 = __int_as_float(0x4B000000 | ((x ^ 0x80u) & 0xffu)) - 8388736.0f;
     const float f1 = __int_as_float(0x4B000000 | (((x >> 8) ^ 0x80u) & 0xffu)) - 8388736.0f;
     unsigned h;
-    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(h) : "f"(f1), "f"(f0));
+    (h = basalt::volta::cvt_rn_bf16x2(f1, f0));
     return h;
 }
 __device__ __forceinline__ unsigned bf16x2_mul(unsigned a, unsigned b) {
     unsigned d;
-    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+    BASALT_SM100_ASM("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
     return d;
 }
 __device__ __forceinline__ uint4 ld_nc16(const void* p) {

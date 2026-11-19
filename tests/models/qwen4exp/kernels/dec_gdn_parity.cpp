@@ -863,7 +863,9 @@ int main(int argc, char** argv) {
     int dev = 0;
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, dev));
-    if (p.major < 9) { std::printf("dec_gdn_parity: needs thread-block clusters (compute capability %d.%d)\n", p.major, p.minor); return 77; }
+    // without clusters, the parts that need them (dec_gdn_rec_seg) are skipped
+    const bool no_clusters = p.major < 9;
+    if (no_clusters) std::printf("dec_gdn_parity: no thread-block clusters (compute capability %d.%d): parity_gdnf and parity_ple_hist only\n", p.major, p.minor);
     std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
                 p.sharedMemPerBlockOptin >> 10);
     cudaStream_t s;
@@ -872,7 +874,7 @@ int main(int argc, char** argv) {
     CK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
-    const bool ok = mode == "--bench-only" || (parity_gdnf(s) && parity_seg(s) && parity_wide(s) && parity_ple_hist(s));
+    const bool ok = mode == "--bench-only" || (parity_gdnf(s) && (no_clusters || (parity_seg(s) && parity_wide(s))) && parity_ple_hist(s));
     if (mode != "--bench-only") std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise, columns independent of T)" : "FAIL");
     if (ok && (mode == "--bench" || mode == "--bench-only")) { bench_seg(s); bench(s); }
     return ok ? 0 : 1;

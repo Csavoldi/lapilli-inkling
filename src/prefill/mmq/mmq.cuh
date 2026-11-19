@@ -194,12 +194,28 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
     return ggml_cuda_mmq_get_config(type, J, fallback).rows_per_warp();
 }
 
+// On a V100 (no int8 mma), llama.cpp's dp4a path for Q8_0, Q5_1, Q4_K and Q5_K: the one ggml-cuda (and Strata) takes on a
+// V100 with this same "ampere" table. A COMPILE-TIME choice, the same for the host (shared memory size) and the device
+// (functions); -DBASALT_MMQ_DP4A=0 selects the emulated mma path instead.
+#ifndef BASALT_MMQ_DP4A
+#define BASALT_MMQ_DP4A 1
+#endif
+#if BASALT_MMQ_DP4A && defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 700
+#error "BASALT_MMQ_DP4A: the dp4a MMQ path is for sm_70 only"
+#endif
+#include "mmq_dp4a_sizes.cuh"
+
 static constexpr __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config & config) {
+    if (ggml_cuda_mmq_dp4a_type(config.type)) {   // the dp4a path's tiles
+        const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(config.type, config.I);
+        return (txs.qs + txs.dm + txs.sc) * 4;
+    }
     return config.I * ggml_cuda_mmq_get_sram_stride(config.sram_layout) * 4;
 }
 
 #include "mmq_load_tiles.cuh"
 #include "mmq_vec_dot.cuh"
+#include "mmq_dp4a_funcs.cuh"   // the dp4a path (Volta)
 
 template<ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
@@ -250,6 +266,28 @@ struct ggml_cuda_mmq_util_funcs {
 
 template <ggml_type type, int J, bool fallback>
 static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_funcs() {
+    // the original dp4a functions for these four formats (paired as in llama.cpp 3cf03257)
+    if constexpr (ggml_cuda_mmq_dp4a_type(type) && type == GGML_TYPE_Q8_0) {
+        return ggml_cuda_mmq_util_funcs(
+            ggml_cuda_mmq_load_tiles_q8_0_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+    } else if constexpr (ggml_cuda_mmq_dp4a_type(type) && type == GGML_TYPE_Q5_1) {
+        return ggml_cuda_mmq_util_funcs(
+            ggml_cuda_mmq_load_tiles_q5_1_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+    } else if constexpr (ggml_cuda_mmq_dp4a_type(type) && type == GGML_TYPE_Q4_K) {
+        return ggml_cuda_mmq_util_funcs(
+            ggml_cuda_mmq_load_tiles_q4_K_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+    } else if constexpr (ggml_cuda_mmq_dp4a_type(type) && type == GGML_TYPE_Q5_K) {
+        return ggml_cuda_mmq_util_funcs(
+            ggml_cuda_mmq_load_tiles_q5_K_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+    }
     switch (type) {
         case GGML_TYPE_Q2_0:
             return ggml_cuda_mmq_util_funcs(

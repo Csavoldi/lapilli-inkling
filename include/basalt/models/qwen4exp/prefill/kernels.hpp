@@ -74,6 +74,10 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// moe_combine where the rows [peer0, peer1) of D are the second card's, already summed per token (with their weights)
+/// into bo, read here then overwritten: bo = shared * sigmoid(sg) + (sum of the other slots + bo)
+void moe_combine_peer(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                      int64_t T, int64_t peer0, int64_t peer1, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).

@@ -1,3 +1,5 @@
+#include <string>
+#include <cstdlib>
 #include "gpu.hpp"
 
 #include "basalt/log.hpp"
@@ -68,7 +70,27 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     // The split hands a window's activations from one card to the next, and a tier card reads its experts d2d: both
     // want peer access, which every pair must opt into once per process.  A pair the driver refuses is left alone and
     // the copy goes the long way.
-    if (chosen_cards.size() > 1) {
+    // BASALT_PEER_NO_P2P=1 (or STRATA_PEER_NO_P2P=1, Strata's setting) leaves every pair without peer access, as does the
+    // default as soon as a chosen card is a Volta (compute 7.x): direct copies between two V100s were found to return
+    // wrong data. The copies then go the long way, through the host, as for a pair the driver refuses.
+    // BASALT_PEER_NO_P2P=0 requests peer access anyway.
+    bool no_p2p = false;
+    {
+        const char* e1 = std::getenv("BASALT_PEER_NO_P2P");
+        const char* e2 = std::getenv("STRATA_PEER_NO_P2P");
+        bool volta = false;
+        for (int a = 0; a < (int) chosen_cards.size(); ++a) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, a) == cudaSuccess && major == 7) volta = true;
+            (void) cudaGetLastError();
+        }
+        if (e1 && *e1) no_p2p = std::string(e1) != "0";
+        else if (e2 && *e2) no_p2p = std::string(e2) != "0";
+        else no_p2p = volta;
+        if (no_p2p && chosen_cards.size() > 1)
+            basalt::log::info("basalt", "peer access: off (%s)", e1 && *e1 ? "BASALT_PEER_NO_P2P" : e2 && *e2 ? "STRATA_PEER_NO_P2P" : "Volta");
+    }
+    if (chosen_cards.size() > 1 && !no_p2p) {
         int pairs = 0, tried = 0, prev = 0;
         cudaGetDevice(&prev);
         for (int a = 0; a < (int) chosen_cards.size(); ++a)

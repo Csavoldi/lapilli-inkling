@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <string>
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -1392,18 +1393,15 @@ static_assert(MAX_NCOLS * MvCfg<2>::R * 9 * 4 <= MvCfg<2>::SMEM && MAX_NCOLS * M
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 template<int N> __device__ __forceinline__ void mv_cp(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
-                 "l"(src), "n"(N) : "memory");
+    basalt::volta::cp_async_ca<N>((unsigned) __cvta_generic_to_shared(dst), src);
 }
-__device__ __forceinline__ void mv_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void mv_commit() { basalt::volta::cp_async_commit(); }
 template<int N> __device__ __forceinline__ void mv_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+    basalt::volta::cp_async_wait<N>();
 }
 // d = A (16 x 32 s8, row) * B (32 x 8 s8, col), C = 0: the exact int32 dots
 __device__ __forceinline__ void mv_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    basalt::volta::mma_16832_s32_s8<false>(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b0, b1, 0, 0, 0, 0);
 }
 // iq4_table_lookup's CUDA lookup with the codebook words in registers: the same int8 values
 __device__ __forceinline__ int2 mv_iq4_lookup(uint32_t q4, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {

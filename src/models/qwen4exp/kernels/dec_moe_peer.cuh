@@ -17,8 +17,8 @@ union DmPeerShared {
 // the window (a record in diag_m, done_m past every ring) and the kernel exits.
 // Q2: Q2_0 gate/up rows two a warp as well (a build of its own, so the other formats' kernel stays as it was)
 // MIX: the GDN mixer split's item (a build of its own, so the window without the split keeps its kernel)
-template<bool Q2, bool MIX>
-__global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
+template<bool Q2, bool MIX, int MINB = 4>   // MINB: at least MINB blocks an SM (4: upstream's bound)
+__global__ void __launch_bounds__(kDmThreads, MINB) dm_peer_kernel(DmPeerArgs a) {
     __shared__ DmPeerShared su;
     DmShared& sm = su.d;
     __shared__ uint32_t s_seq;
@@ -47,6 +47,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         __threadfence();
     }
     DmWatch w;
+    __shared__ unsigned long long s_fe;   // peer-card diagnostic: when block 0's reread of the ring ends
     w.abort = abort; w.diag_m = a.diag_m; w.seq_m = a.seq_m; w.done_m = a.done_m; w.hdr_ids = hdr->ids;
     w.mdone_m = a.mix != nullptr ? a.mdone_m : nullptr;
     auto stamp = [&](int s, int i) {
@@ -60,6 +61,11 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         const uint32_t ring = (uint32_t) s + 1u;
         block_q8_1* xq = warm && (s & 1) ? xq2 : xq0;
         w.ring = ring; w.layer = -1; w.n_tok = 0; w.n = 0;
+        w.st = a.stamps_m != nullptr ? a.stamps_m + (size_t) s * 8 : nullptr;   // peer-card diagnostic: the ring's 8 stamps
+        w.st2 = a.stamps_m != nullptr && 3 * a.steps <= 256 ? a.stamps_m + ((size_t) 2 * a.steps + s) * 8 : nullptr;   // peer-card diagnostic: 8 more stamps a ring (256: the host's reserve, in rows of 8)
+        w.u5 = (a.gu2 & 4) != 0;   // BASALT_PEER_U5: dm_row_dot's unrolled gate/up row
+        w.prof = a.stamps_m != nullptr && s == a.steps / 2 && 24 * a.steps + 4 * nb <= 2048
+                     ? a.stamps_m + 24 * (size_t) a.steps + 4 * (size_t) blockIdx.x : nullptr;   // peer-card diagnostic: 4 words a block, on the middle ring
         if (a.mix != nullptr && a.mix[s]) {   // the layer's mixer doorbell, ahead of its MoE ring
             if (blockIdx.x == 0) {
                 if (tid == 0) {
@@ -142,6 +148,10 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 uint32_t v = 0xffffffffu;   // an aborted window stops here
                 if (*(volatile unsigned int*) abort == 0u)
                     while (((v = *a.seq_m) & 0xffffu) < ring) spin_pause();
+                if (const int dly = (a.gu2 >> 8) & 255; dly != 0 && v != 0xffffffffu) {   // BASALT_PEER_DELAY_US (a latency sensitivity test)
+                    const unsigned long long t0 = dm_now();
+                    while (dm_now() - t0 < (unsigned long long) dly * 1000ull) __nanosleep(100);
+                }
                 __threadfence_system();
                 s_seq = v;
                 if (warm && s > 0)   // the warm-up stops
@@ -179,9 +189,11 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 hdr->n_peer = 0;
             }
             __threadfence();
+            if (tid == 0) s_fe = dm_now();   // peer-card diagnostic
         }
         if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
         stamp(s, 1);
+        if (w.st2 != nullptr && blockIdx.x == 0 && tid == 0) w.st2[5] = s_fe;   // peer-card diagnostic: stored after the barrier
         if (hdr->n_tok < 0) return;              // released: the window is being abandoned
         const bool warm_next = warm && s + 1 < a.steps && blockIdx.x != 0;
         const int w_tok = min(hdr->n_tok, kVerifyMaxT), w_layer = hdr->layer;
@@ -215,9 +227,11 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         }
         if (big && tid == 0) dm_abort(w, &sm, 2u, 0u, -1, 0u, 0u);
         stamp(s, 2);
+        if (w.prof != nullptr && tid == 0) w.prof[0] = dm_now();   // peer-card diagnostic: when THIS block's experts start
         if (!bad && !big) {
             dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w);
         }
+        if (w.prof != nullptr && tid == 0) w.prof[2] = dm_now();   // when its experts end
         stamp(s, 3);
         __threadfence_system();
         ++served;

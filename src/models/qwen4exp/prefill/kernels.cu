@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::prefill {
 namespace {
@@ -131,20 +132,15 @@ static_assert(LR % UM_BK == 0 && N % UM_BD == 0 && UM_KT >= UM_ST - 1, "gr_up_mi
 
 __device__ __forceinline__ void um_cp16(void* smem, const void* gmem, bool valid) {
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gmem), "r"(valid ? 16 : 0));
+    basalt::volta::cp_async_cg16(sa, gmem, valid ? 16 : 0);
 }
-__device__ __forceinline__ void um_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void um_commit() { basalt::volta::cp_async_commit(); }
 __device__ __forceinline__ void um_ldsm4(uint32_t (&r)[4], const void* smem) {
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(sa));
+    basalt::volta::ldmatrix_x4<false>(r[0], r[1], r[2], r[3], sa);
 }
 __device__ __forceinline__ void um_mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_bf16(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b0, b1, d[0], d[1], d[2], d[3]);
 }
 // a tile row (UM_BK bf16) is four 16-byte chunks, the chunk index XORed with the row's bits 1-2 so that the eight rows
 // of an ldmatrix read sit in distinct banks
@@ -196,7 +192,7 @@ __device__ void gr_up_mix_block(const uint16_t* __restrict__ lo16, const uint16_
     for (int s = 0; s < UM_ST - 1; ++s) load(s, s);
 #pragma unroll 1
     for (int kt = 0; kt < UM_KT; ++kt) {
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(UM_ST - 2));
+        basalt::volta::cp_async_wait<UM_ST - 2>();
         __syncthreads();
         if (kt + UM_ST - 1 < UM_KT) load((kt + UM_ST - 1) % UM_ST, kt + UM_ST - 1);
         else um_commit();
@@ -445,6 +441,22 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
 #pragma unroll
     for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
     bo[i] = s + shared[i] * sigm(sg[t]);
+}
+// See kernels.hpp; bo holds the peer's sums on entry (each thread reads then writes its own element)
+__global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                        const float* __restrict__ w, const float* __restrict__ shared,
+                                        const float* __restrict__ sg, float* bo, int64_t T, int64_t peer0, int64_t peer1) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int64_t p = slot[t * 10 + k];
+        if (p >= peer0 && p < peer1) continue;
+        s = fmaf(w[t * 10 + k], Dm[p * N + d], s);
+    }
+    bo[i] = (s + bo[i]) + shared[i] * sigm(sg[t]);
 }
 
 // ---------------------------------------------------------------- QSA helpers
@@ -706,6 +718,11 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                  int64_t T, void* stream) {
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
     check("moe_combine");
+}
+void moe_combine_peer(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                      int64_t T, int64_t peer0, int64_t peer1, void* stream) {
+    moe_combine_peer_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, peer0, peer1);
+    check("moe_combine_peer");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

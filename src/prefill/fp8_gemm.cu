@@ -17,6 +17,7 @@
 // ends), the consumers write their rounded values into the tile and TMA stores write it out, so no thread waits on a
 // load or a store of its own; the tile's token scales are copied into shared memory at the block's start for the same
 // reason.  FP32 outputs go straight from the accumulators.
+#include "basalt/kernels/volta_sm100.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include <cuda.h>
@@ -29,6 +30,7 @@
 #include <cstring>
 
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::prefill::fp8 {
 namespace {
@@ -83,50 +85,50 @@ struct Args {
 
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+    basalt::volta::ldmatrix_x4<false>(r0, r1, r2, r3, a);
 }
 __device__ __forceinline__ void ldsm2(unsigned& r0, unsigned& r1, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
+    basalt::volta::ldmatrix_x2<false>(r0, r1, a);
 }
 // m16n8k32 e4m3 x e4m3 -> f32, block-scaled with both scales 0x7f (2^0): the raw dot product at full accumulate rate
 __device__ __forceinline__ void mma_e4m3(float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1, unsigned a2,
                                          unsigned a3, unsigned b0, unsigned b1) {
     constexpr unsigned short z = 0;
-    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+    BASALT_SM100_ASM("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0x7Fu), "h"(z), "h"(z), "r"(0x7Fu), "h"(z), "h"(z));
 }
 __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
+    BASALT_SM100_ASM("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
 }
 __device__ __forceinline__ void mb_wait(unsigned long long* b, unsigned phase) {
-    asm volatile("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
+    BASALT_SM100_ASM("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
                  ::"r"(su(b)), "r"(phase), "r"(0x989680u) : "memory");
 }
 __device__ __forceinline__ void mb_arrive(unsigned long long* b) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(su(b)) : "memory");
+    BASALT_SM100_ASM("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(su(b)) : "memory");
 }
 __device__ __forceinline__ void mb_expect(unsigned long long* b, unsigned bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(su(b)), "r"(bytes) : "memory");
+    BASALT_SM100_ASM("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(su(b)), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* map, int k, int row, unsigned long long* bar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+    BASALT_SM100_ASM("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  ::"r"(su(dst)), "l"(map), "r"(k), "r"(row), "r"(su(bar)) : "memory");
 }
 // The tile at `src` out to the map at (c0, c1); stores_read waits until every store issued has read its tile (the block
 // may then end, or reuse the memory).
 __device__ __forceinline__ void tma_store2d(const TmaDesc* map, int c0, int c1, const void* src) {
-    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];" ::"l"(map), "r"(c0), "r"(c1), "r"(su(src))
+    BASALT_SM100_ASM("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];" ::"l"(map), "r"(c0), "r"(c1), "r"(su(src))
                  : "memory");
 }
 __device__ __forceinline__ void stores_read() {
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+    BASALT_SM100_ASM("cp.async.bulk.commit_group;" ::: "memory");
+    BASALT_SM100_ASM("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
 // 16 bytes to shared memory, the first `n` of them from src and zeros after
 __device__ __forceinline__ void cp16z(void* dst, const void* src, int n) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(su(dst)), "l"(src), "r"(n) : "memory");
+    basalt::volta::cp_async_cg16(su(dst), src, n);
 }
 // byte offset of (row, logical byte) in a 128-byte-row tile the TMA wrote with the 128-byte swizzle
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
@@ -160,7 +162,7 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
         }
         mb_init(tile_in, 1);
         mb_init(tile_out, WT * WR);
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        BASALT_SM100_ASM("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
     if (threadIdx.x < 32) {
@@ -184,8 +186,8 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
         if constexpr (BF16) {   // the tile's token scales, a 16-byte piece a lane, while the first stages come in
             const int t = tok0 + (int) threadIdx.x * 4;
             cp16z(scale_s + threadIdx.x * 4, p.a_scale + t, min(max(p.ntok - t, 0), 4) * 4);
-            asm volatile("cp.async.commit_group;" ::: "memory");
-            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            basalt::volta::cp_async_commit();
+            basalt::volta::cp_async_wait<0>();
         }
         const bool add = BF16 && p.epi == (int) Epilogue::AddBf16;
         const int fetch_at = max(first, p.k_tiles - FETCH_STAGES);
@@ -257,7 +259,7 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
                              af[slot][mt][2], af[slot][mt][3], bf[slot][mr][0], bf[slot][mr][1]);
         }
         // the stage's reads (generic proxy) are ordered before the producer's async-proxy refill
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        BASALT_SM100_ASM("fence.proxy.async.shared::cta;" ::: "memory");
         __syncwarp();
         if (lane == 0) mb_arrive(empty + st);
     };
@@ -300,7 +302,7 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
                 }
             }
         // the tile's writes (generic proxy) are ordered before the store's async-proxy read
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        BASALT_SM100_ASM("fence.proxy.async.shared::cta;" ::: "memory");
         __syncwarp();
         if (lane == 0) mb_arrive(tile_out);
     } else {

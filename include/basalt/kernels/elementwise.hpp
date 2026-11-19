@@ -94,6 +94,19 @@ void wait_word(const uint32_t* word, uint32_t value, void* stream);
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
 /// operation, which is submitted separately and costs a flush per node).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
+/// acc[tok[i], :] += w[i] * rows[i, :] for `n` rows of `width` floats whose tokens are all distinct (one expert's rows): no
+/// two threads touch one element, and launches in order on one stream add in a fixed order.
+void accumulate_rows(float* acc, const float* rows, const float* w, const int32_t* tok, int64_t n, int64_t width, void* stream);
+/// `rows` rows of `width` floats (device) as FP16 bits in out[rows * width], each row times its own power of two (scale[r]
+/// holds the factor back; the row's largest |value| lands in [2^14, 2^15), so nothing overflows; NaN and inf stay so), and
+/// the way back from mapped host memory: dst[r, :] = fp16(src[r, :]) * scale[r] (width a multiple of 8).
+void rows_to_f16_scaled(const float* acc, uint16_t* out, float* scale, int64_t rows, int64_t width, void* stream);
+void rows_from_f16_scaled_mapped(float* dst, const void* src, const float* scale, int64_t rows, int64_t width, void* stream);
+/// accumulate_rows for one launch's rows of several experts at once: for each of the n_tokens tokens utok[u], its rows
+/// idx[off[u] .. off[u+1]) (in expert order), acc[utok[u], :] += w[row] * rows[row, :] in that order: the same additions,
+/// in the same order, as one accumulate_rows per expert.
+void accumulate_rows_csr(float* acc, const float* rows, const float* w, const int32_t* utok, const int32_t* off,
+                         const int32_t* idx, int64_t n_tokens, int64_t width, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With

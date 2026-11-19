@@ -133,7 +133,10 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
     return true;
 }
 
-bool gpu_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
+// the V100 (compute capability 7.0) is supported too, for the Volta port.
+bool gpu_supported(const GpuCard& c) {
+    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 7 && c.cc_minor == 0);
+}
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);

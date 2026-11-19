@@ -10,6 +10,7 @@
 // adds the four warps' butterflies in rank order through distributed shared memory; rank 0 computes alpha, rank 1
 // beta, and the others read them the same way.  The state and every constant are loaded before the grid
 // dependency wait (the window never writes the state).
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/kernels/gdn_window.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
@@ -178,7 +179,7 @@ __device__ __forceinline__ void rec_sync() {
 // gin_a[t * h_v + gh] and beta at gin_b[t * h_v + gh] (dec_gdn_gates).
 template<int MAXT, int NJ, bool SPLIT, bool SUB = false, bool GIN = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ, rec_rows(MAXT)>& sm,
-                                          cg::cluster_group* cluster, const float* gin_a = nullptr,
+                                          BASALT_CLUSTER_T* cluster, const float* gin_a = nullptr,
                                           const float* gin_b = nullptr) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
@@ -205,16 +206,15 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     for (int i = tid; !GIN && i < 2 * 32 * NJ; i += S) {   // the alpha/beta rows into shared memory
         const int r = i / (32 * NJ), k = i % (32 * NJ);
         const uint4* src = reinterpret_cast<const uint4*>((r ? a.w_beta : a.w_alpha) + (size_t) gh * a.n_embd) + k;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t) __cvta_generic_to_shared(&sm.wab[r][k])),
-                     "l"(src) : "memory");
+        basalt::volta::cp_async_cg16((uint32_t) __cvta_generic_to_shared(&sm.wab[r][k]), src);
     }
-    asm volatile("cp.async.commit_group;" ::: "memory");
+    basalt::volta::cp_async_commit();
     const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
-    if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
-    asm volatile("cp.async.wait_all;" ::: "memory");
+    basalt::volta::cp_async_wait_all();
     rec_sync<SUB>();
     if constexpr (GIN) {
     } else if constexpr (SPLIT) {   // a token per warp
@@ -224,8 +224,8 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
         }
     } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
-        asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+        BASALT_CLUSTER_ASM("barrier.cluster.arrive.relaxed.aligned;");
+        BASALT_CLUSTER_ASM("barrier.cluster.wait.aligned;");
         for (int t = rank * RG + rg; t < T; t += 4 * RG) {
             float al, be;
             ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
@@ -234,10 +234,10 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
                 *cluster->map_shared_rank(&sm.b[t], lane) = be;
             }
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");   // waited on before the gates are read
+        BASALT_CLUSTER_ASM("barrier.cluster.arrive.release.aligned;");   // waited on before the gates are read
     }
     pdl_wait();
-    if constexpr (!SPLIT) asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if constexpr (!SPLIT) BASALT_CLUSTER_ASM("barrier.cluster.wait.acquire.aligned;");
     if constexpr (GIN) {   // thread t's gates, read by thread t and, past the barriers below, the block
         if (tid < T) { sm.g[tid] = gin_a[(size_t) tid * a.h_v + gh]; sm.b[tid] = gin_b[(size_t) tid * a.h_v + gh]; }
     }
@@ -388,9 +388,9 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
 }
 
 template<int MAXT, int NJ>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
+__global__ void BASALT_CLUSTER_DIMS(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
     __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
-    cg::cluster_group cl = cg::this_cluster();
+    BASALT_CLUSTER_T cl = BASALT_THIS_CLUSTER();
     rec_block<MAXT, NJ, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
 
@@ -427,13 +427,13 @@ __device__ __forceinline__ DecRecArgs seg_args(const DecRecArgs& a0, const SegRo
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
 template<int MAXT, int NJ>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
+__global__ void BASALT_CLUSTER_DIMS(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
                                                                               size_t state_off, const SegDst* dst,
                                                                               size_t off_c, size_t off_hv) {
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
     __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
-    cg::cluster_group cl = cg::this_cluster();
+    BASALT_CLUSTER_T cl = BASALT_THIS_CLUSTER();
     rec_block<MAXT, NJ, false>(seg_args(a0, r, state_off, dst, off_c, off_hv), r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
 
@@ -502,6 +502,18 @@ static int mapped_heads(const DecRecArgs& a) {
 
 bool dec_gdn_rec_supported(int n_embd) { return n_embd == 2560 || n_embd == 5120; }
 
+bool dec_gdn_clusters() {
+    static int known[64] = {};   // per card: 0 not read yet, 1 yes, -1 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    if (known[dev] == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) { (void) cudaGetLastError(); major = 0; }
+        known[dev] = major >= 9 ? 1 : -1;
+    }
+    return known[dev] > 0;
+}
+
 // the kernel for a block width: NJ = n_embd / 256
 template<template<int, int> class K, class L>
 static void by_width(int n_embd, int max_t, L launch) {
@@ -524,6 +536,15 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
         basalt::log::error("basalt", "dec_gdn_rec: invalid arguments");
         std::exit(1);
     }
+    if (!dec_gdn_clusters()) {   // no block clusters: the two launches instead (the same bits)
+        if (!a.o) {
+            basalt::log::error("basalt", "dec_gdn_rec: this card has no block clusters and the call gives no a.o");
+            std::exit(1);
+        }
+        dec_gdn_rec_split(a, n_tok, stream);
+        dec_gdn_rec_norm(a, n_tok, stream);
+        return;
+    }
     const dim3 grid((unsigned) (mapped_heads(a) * 4)), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
     by_width<RecK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, n_tok); });
@@ -536,6 +557,10 @@ void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, 
     if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 ||
         a.h_v % a.h_k != 0 || a.nk != 0) {
         basalt::log::error("basalt", "dec_gdn_rec_seg: invalid arguments");
+        std::exit(1);
+    }
+    if (!dec_gdn_clusters()) {
+        basalt::log::error("basalt", "dec_gdn_rec_seg: this card has no block clusters (dec_gdn_gates then dec_gdn_rec_seg_split)");
         std::exit(1);
     }
     const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);

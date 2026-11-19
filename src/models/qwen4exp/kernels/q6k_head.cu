@@ -4,6 +4,11 @@
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#define BASALT_REDUCE_ADD(m, v) basalt::volta::reduce_add_sync((m), (v))
+#else
+#define BASALT_REDUCE_ADD(m, v) __reduce_add_sync((m), (v))
+#endif
 #include "head_proxy.cuh"
 #include "smem_opt_in.cuh"
 
@@ -15,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -366,9 +372,7 @@ struct VScratch {   // the scoring kernel's last block leaves its part zeroed fo
 };
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    basalt::volta::mma_16832_s32_s8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1, 0, 0, 0, 0);
 }
 
 // One thread per (row, group): the group's dequantized Q6_K values fitted as head_proxy.cuh fits them, its levels
@@ -525,7 +529,7 @@ __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict
 #pragma unroll
         for (int i = 0; i < VHIST / 32; ++i) v[i] = __ldcg(&vs->hist[c][i * 32 + lane]);
 #pragma unroll
-        for (int i = 0; i < VHIST / 32; ++i) tot[i] = __reduce_add_sync(0xffffffffu, v[i]);
+        for (int i = 0; i < VHIST / 32; ++i) tot[i] = BASALT_REDUCE_ADD(0xffffffffu, v[i]);
         unsigned run = 0, row_v = 0;
         int row = -1;
 #pragma unroll

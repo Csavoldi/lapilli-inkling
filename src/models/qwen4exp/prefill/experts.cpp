@@ -20,9 +20,16 @@ bool Prefill::Run::Chunk::Experts::execute() {
 
 bool Prefill::Run::Chunk::Experts::Group::execute() {
     if (!group()) return false;
-    if (!cpu_start()) return false;
-    prepare_products();
-    if (!peer_experts()) return false;
+    if (cpu_late_on()) {   // the peer's activations first, then the CPU's (only if it takes experts)
+        prepare_products();
+        if (!peer_experts()) return false;
+        if (!cpu_download_late()) return false;
+        if (!cpu_start()) return false;
+    } else {
+        if (!cpu_start()) return false;
+        prepare_products();
+        if (!peer_experts()) return false;
+    }
     if (!start_staging()) return false;
     return walk();
 }

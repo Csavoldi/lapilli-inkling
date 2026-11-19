@@ -1,4 +1,5 @@
 // src/models/qwen4exp/serve/prompt.cpp - prompt operations for the persistent engine.
+#include <cstdlib>
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
@@ -136,6 +137,18 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
     // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
     int64_t cap = runtime_.read_cap();
+    // Just above the longest chunk the peer card computes the rows of, a prompt reads faster in equal
+    // routed chunks it shares than in one streamed chunk where it only sends its experts over its link (2x V100, x4
+    // link: ~870 tokens/s routed against ~8.9 s per streamed chunk + 0.19 ms a token); BASALT_ROUTED_UNTIL=0 turns it off
+    {
+        static const int64_t routed_until = [] {
+            const char* v = std::getenv("BASALT_ROUTED_UNTIL");
+            // 15,500 by default: the crossover measured through the server
+            return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 15500;
+        }();
+        const int64_t peer_rows = runtime_.sp.peer_routed_rows_max();
+        if (!beside && peer_rows > 0 && tokens > peer_rows && tokens < routed_until) cap = std::min(cap, peer_rows);
+    }
     // Loan limits beside decoding slots: the loan stays within kLendCapDecoding slots (they keep their experts in
     // the cache) and takes only slots whose expert has a RAM copy (a lent slot is refilled from RAM, never read
     // from the file, while the slots decode).  A read that runs alone, on an idle engine or while the slots wait

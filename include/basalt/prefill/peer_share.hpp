@@ -34,6 +34,13 @@ public:
         int64_t launch_rows = 1024;    ///< rows of one launch; a group with more takes several
         int stage_bufs = kMaxBufs;     ///< groups staged at once (1 to 3)
         int bufs = kMaxBufs;           ///< launches in flight (2 or 3)
+        /// The second card sends, per layer, one row per token - the sum of its rows of that token, each
+        /// times its Expert::w, in a fixed order - into `dst` (n_tokens rows) instead of its rows
+        bool combine = false;
+        /// With `combine`, the sums cross as FP16 rows with a power of two per row (half the bytes)
+        bool sums16 = false;
+        /// With `combine`, a launch's rows summed in one kernel (CSR by token) instead of one per expert
+        bool acc_fused = false;
     };
     /// Device bytes on the second card, and pinned host bytes, `open` takes.
     static uint64_t peer_bytes(const Dims& d);
@@ -84,6 +91,7 @@ public:
         const uint8_t* blob = nullptr;
         bool on_peer = false;
         const int32_t* tok = nullptr;
+        const float* w = nullptr;   ///< with Dims::combine, each row's weight (as tok)
         int n = 0;
         bool group = false;
     };
@@ -97,6 +105,15 @@ public:
     /// `stream` (main card) waits for the rows of the last `run`. The host waits only until the second card's calls are
     /// issued (a thread of its own issues them). False when one of them failed.
     bool join(void* stream, std::string& err);
+    /// The share was opened with Dims::combine
+    bool combines() const;
+    /// `stream` (main card) waits until the last `run`'s activations have left for the host (its copies
+    /// first in the copy engine)
+    void wait_activations(void* stream) const;
+    /// The next `run`'s activations x [n_tokens][n_embd] (main card, ready on `main_stream`), sent now, before
+    /// the routing: quantized for `gu_type` into the mapped host buffer and copied to the second card as soon as they are.
+    /// `run` then takes them as they are (the same bytes) when its x, n_tokens and type match. False: not sent.
+    bool send_activations(int gu_type, const float* x, int n_tokens, void* main_stream);
 
 private:
     struct Impl;

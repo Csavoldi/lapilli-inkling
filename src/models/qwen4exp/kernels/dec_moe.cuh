@@ -2,6 +2,7 @@
 // kernel templates, with no kernel of its own in it, so a TU that includes it compiles only the kernels it names.  The kernels
 // are in dec_moe_kernels.cuh and dec_moe_peer.cuh, the launchers in dec_moe_host.cuh.
 #pragma once
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/core/diag.hpp"
@@ -559,13 +560,27 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
 
 // ---------------------------------------------------------------- the grouped rows, one work item at a time
 // native_gu_multi_kernel's body for block row `rb` of one group (entries [e0, e1)): the same calls in the same order.
+// row_dot_multi, or its unrolled twin when `u5` and a lane makes exactly 5 calls (Q4_K, Q5_K at n_embd 2560): the same
+// bits either way.
+template<int TY, int NC, bool EXACT_N, bool STAGE_GRID>
+__device__ __forceinline__ void dm_row_dot(bool u5, const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                           int nb, int lane, float (&s)[NC], const uint32_t* s_grid) {
+    if constexpr (TY == 12 || TY == 13) {
+        if (u5 && nb * Fmt<TY>::ipb == 160) {
+            row_dot_multi_u<TY, NC, 5, EXACT_N, STAGE_GRID>(row, x, off, n, lane, s, s_grid);
+            return;
+        }
+    }
+    row_dot_multi<TY, NC, EXACT_N, STAGE_GRID>(row, x, off, n, nb, lane, s, s_grid);
+}
+
 // gate/up row `row` (0 .. 2 n_ff: gate rows, then up rows) at `wr`, for entries [e0, e1)
 // `blob` is the expert's blob (its output scales: expert_out_scale).
 template<int TG, bool STAGE_GRID>
 __device__ __forceinline__ void dm_gu_row(const uint8_t* wr, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                           const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                           float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
-                                          int lane, unsigned long long blob) {
+                                          int lane, unsigned long long blob, bool u5 = false) {   // u5: the unrolled row (dm_row_dot)
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
@@ -576,13 +591,13 @@ __device__ __forceinline__ void dm_gu_row(const uint8_t* wr, int row, int e0, in
         if (n == 1) {
             const int off1[1] = { ent_tok[e] * xb };
             float s1[1];
-            row_dot_multi<TG, 1, true, STAGE_GRID>(wr, xq, off1, 1, nb, lane, s1, s_grid);
+            dm_row_dot<TG, 1, true, STAGE_GRID>(u5, wr, xq, off1, 1, nb, lane, s1, s_grid);
             tail_scale<TG>(s1, sc);
             if (lane == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
         } else if (n == 2) {
             const int off2[2] = { ent_tok[e] * xb, ent_tok[e + 1] * xb };
             float s2[2];
-            row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
+            dm_row_dot<TG, 2, true, STAGE_GRID>(u5, wr, xq, off2, 2, nb, lane, s2, s_grid);
             tail_scale<TG>(s2, sc);
             if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane];
         } else {
@@ -604,19 +619,19 @@ template<int TG, bool STAGE_GRID, int TU = TG>
 __device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                            const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, int rb,
                                            float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
-                                           int warp, int lane) {
+                                           int warp, int lane, bool u5 = false) {   // u5: the unrolled row (dm_row_dot)
     const int row = rb * GU_ROWS + warp;
     if (row >= 2 * L.n_ff) return;
     if constexpr (TG != TU) {
         if (row >= L.n_ff) {
             dm_gu_row<TU, false>(blob + L.up_off + (size_t) (row - L.n_ff) * L.up_row, row, e0, e1, ent_tok, xq, L,
-                                 gate, up, nullptr, lane, (unsigned long long) blob);
+                                 gate, up, nullptr, lane, (unsigned long long) blob, u5);
             return;
         }
     }
     // a uniform layer's gate and up rows are contiguous in the blob: row `row` is at row * gu_row
     dm_gu_row<TG, STAGE_GRID>(blob + (size_t) row * L.gu_row, row, e0, e1, ent_tok, xq, L, gate, up, s_grid, lane,
-                              (unsigned long long) blob);
+                              (unsigned long long) blob, u5);
 }
 
 template<int TG>
@@ -924,6 +939,10 @@ struct DmWatch {
     uint32_t ring = 0;
     int layer = 0, n_tok = 0, n = 0;
     const int32_t* hdr_ids = nullptr;                      // the device copy of the ring's ids (the record's checksum)
+    unsigned long long* st = nullptr;                      // peer-card diagnostic: the ring's 8 slots, or null
+    unsigned long long* st2 = nullptr;                     // peer-card diagnostic: 8 more slots, or null
+    bool u5 = false;                                       // the unrolled gate/up row (dm_row_dot)
+    unsigned long long* prof = nullptr;                    // peer-card diagnostic: THIS block's 4 words, or null
 };
 
 __device__ __forceinline__ unsigned long long dm_now() {
@@ -1002,10 +1021,21 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     else s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
     const int warp = tid >> 5, lane = tid & 31;
     const int ng = sm.ng;
+    const bool u5 = watch != nullptr && watch->u5;
     const int ir = g2 ? GU2_ROWS : GU_ROWS;
     const int nrb = (int) ((2 * L.n_ff + ir - 1) / ir);
+    // Peer-card diagnostic: block 0's first item split into phases; thread 0 keeps the times in sm.out (nobody reads it
+    // during the gate/up: the down writes it after its first barrier), written out after the loop
+    const bool d3 = watch != nullptr && watch->st2 != nullptr && b == 0 && tid == 0;
+    unsigned long long* d3t = reinterpret_cast<unsigned long long*>(sm.out);
+    if (d3) {
+#pragma unroll
+        for (int i = 0; i < 5; ++i) d3t[i] = 0ull;
+    }
     for (int it = b; it < ng * nrb; it += nb) {
         const int g = it / nrb, rb = it - g * nrb;
+        if (d3 && it == b) d3t[0] = dm_now();
+        if (d3 && it == b + nb) d3t[4] = dm_now();
         if constexpr (K2) {
             const int row = rb * GU2_ROWS + 2 * warp;
             if (g2) {
@@ -1014,16 +1044,35 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
                                          gate, up, s_grid, lane);
             } else {
                 dm_gu_item<TG, SG, TU>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb,
-                                       gate, up, s_grid, warp, lane);
+                                       gate, up, s_grid, warp, lane, u5);
             }
         } else {
             dm_gu_item<TG, SG, TU>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate,
-                                   up, s_grid, warp, lane);
+                                   up, s_grid, warp, lane, u5);
         }
+        if (d3 && it == b) d3t[1] = dm_now();
         __threadfence();
+        if (d3 && it == b) d3t[2] = dm_now();
         __syncthreads();
         if (tid == 0) atomicAdd(done + g, 1u);
+        if (d3 && it == b) d3t[3] = dm_now();
     }
+    if (d3) {   // written once
+#pragma unroll
+        for (int i = 0; i < 5; ++i) watch->st2[i] = d3t[i];
+    }
+    if (watch != nullptr && watch->prof != nullptr && tid == 0) {   // peer-card diagnostic: the end of THIS block's gate/up
+        unsigned int smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+        const int nspd = (int) ((L.n_embd + kDmSpan - 1) / kDmSpan), nit = ng * nspd;
+        const unsigned int ndown = b < nit ? (unsigned int) ((nit - 1 - b) / nb + 1) : 0u;
+        watch->prof[1] = dm_now();
+        watch->prof[3] = ((unsigned long long) smid << 24) | ((unsigned long long) (ng & 0xff) << 16) | ndown;
+    }
+    // Peer-card diagnostic: [5] block 0 has finished its gate/up
+    const bool d_st = watch != nullptr && watch->st != nullptr && b == 0 && tid == 0;
+    bool d_first = true;
+    if (d_st) watch->st[5] = dm_now();
     constexpr int R = dm_down_rows<TD>(), SUB = kDmSpan / R;
     const int nsp = (int) ((L.n_embd + kDmSpan - 1) / kDmSpan);
     int g_staged = -1;
@@ -1042,9 +1091,12 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
             }
             __syncthreads();
             if (sm.stop) return;
+            if (d_st && d_first) watch->st[6] = dm_now();   // [6] the wait for its first group is over
             dm_swiglu_q8(gate, up, e0, e1, (int) L.n_ff, sm.hq, tid);
             g_staged = g;
             __syncthreads();
+            if (d_st && d_first) watch->st[7] = dm_now();   // [7] its first SwiGLU done
+            d_first = false;
         }
         for (int sb = 0; sb < SUB; ++sb)
             dm_down_item<TD>((const uint8_t*) sm.gptr[g] + L.down_off + (size_t) ((sp * SUB + sb) * R) * L.d_row, e0, e1,
@@ -1410,14 +1462,14 @@ struct DmTmaShared {
 
 __device__ __forceinline__ uint32_t dm_smem(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void dm_bulk(void* dst, const void* src, uint32_t bytes, unsigned long long* bar) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(dm_smem(bar)), "r"(bytes) : "memory");
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+    BASALT_SM90_ASM("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(dm_smem(bar)), "r"(bytes) : "memory");
+    BASALT_SM90_ASM("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  :: "r"(dm_smem(dst)), "l"(src), "r"(bytes), "r"(dm_smem(bar)) : "memory");
 }
 __device__ __forceinline__ void dm_bar_wait(unsigned long long* bar, uint32_t parity) {
     uint32_t ok = 0;
     while (!ok)
-        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+        BASALT_SM90_ASM("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
                      : "=r"(ok) : "r"(dm_smem(bar)), "r"(parity) : "memory");
 }
 
@@ -1456,7 +1508,7 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
         if (k > 0) __syncthreads();              // stage (k - 1) is consumed: refill it
         if (tid == 0) {
             // the warps read the stage with generic loads; the refill is an async-proxy write
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            BASALT_SM90_ASM("fence.proxy.async.shared::cta;" ::: "memory");
             issue(k + kTmaStages - 1);
         }
         const int st = (base + k) % kTmaStages;
@@ -1505,8 +1557,8 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
 __device__ __forceinline__ void dm_bars_init(DmTmaShared& sm) {
     if (threadIdx.x == 0) {
         for (int i = 0; i < kTmaStages; ++i)
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(dm_smem(&sm.bar[i])) : "memory");
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+            BASALT_SM90_ASM("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(dm_smem(&sm.bar[i])) : "memory");
+        BASALT_SM90_ASM("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 }
 

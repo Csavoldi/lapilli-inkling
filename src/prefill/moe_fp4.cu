@@ -3,6 +3,7 @@
 // fragments through ldmatrix, scale registers per 64-wide K step) follow Infernix's grouped NVFP4 GEMM
 // (src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh, src/ops/common/mma.cuh).
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
+#include "basalt/kernels/volta_sm100.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 
 #include <cuda_fp16.h>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::prefill::fp4 {
 namespace {
@@ -40,15 +42,14 @@ void ck(cudaError_t e, const char* what) {
 __device__ __forceinline__ uint32_t smem_addr(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+    basalt::volta::ldmatrix_x4<false>(r0, r1, r2, r3, addr);
 }
 
 // c += A (16 tokens x 64 values, E2M1 with a UE4M3 scale per 16) * B (64 x 8 weight rows, same format)
 __device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa,
                                         unsigned sfb) {
     constexpr unsigned short kId = 0;
-    asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+    BASALT_SM100_ASM("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(kId), "h"(kId),
@@ -56,13 +57,13 @@ __device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0
 }
 
 __device__ __forceinline__ void cp_async8(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_addr(dst)), "l"(src));
+    basalt::volta::cp_async_ca<8>(smem_addr(dst), src);
 }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr(dst)), "l"(src));
+    basalt::volta::cp_async_cg16(smem_addr(dst), src);
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_commit() { basalt::volta::cp_async_commit(); }
+template <int N> __device__ __forceinline__ void cp_wait() { basalt::volta::cp_async_wait<N>(); }
 
 // the byte of a 64-byte tile row holding logical byte lb of row rr: the four 16-byte chunks rotate with the row so
 // that eight rows of an ldmatrix read different banks
@@ -155,7 +156,7 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             unsigned short c;
-            asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u16.u8 %0, t; }"
+            BASALT_SM100_ASM("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u16.u8 %0, t; }"
                 : "=h"(c) : "f"(v[j]), "f"(v[j + 8]));
             w[j >> 2] |= (uint32_t) (c & 0xff) << (8 * (j & 3));
         }

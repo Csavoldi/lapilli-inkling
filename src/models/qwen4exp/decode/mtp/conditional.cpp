@@ -66,7 +66,11 @@ bool MtpDrafter::capture_cond(int T, int steps) {
         np.conditional.type = cudaGraphCondTypeIf;
         np.conditional.size = 1;
         cudaGraphNode_t node = nullptr;
+#if CUDART_VERSION >= 13000
         ok = cudaGraphAddNode(&node, top, &prev, nullptr, 1, &np) == cudaSuccess;
+#else  // CUDA 12.x
+        ok = cudaGraphAddNode_v2(&node, top, &prev, nullptr, 1, &np) == cudaSuccess;
+#endif
         if (!ok) break;
         cudaGraph_t body = np.conditional.phGraph_out[0];
         ok = cudaStreamBeginCaptureToGraph(cs_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal) ==

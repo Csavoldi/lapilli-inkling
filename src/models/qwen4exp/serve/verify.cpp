@@ -2,6 +2,8 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
+#include <cstdlib>   // getenv
+
 namespace basalt::models::qwen4exp::serve {
 
 basalt::core::Verifier & QfnRuntime::stage_ver(int st) {
@@ -128,7 +130,11 @@ int QfnRuntime::init_verify() {
     }
     ver.set_route_tail_skip(o.route_tail_skip);
     ver.set_route_prior(o.route_prior);
-    ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
+    {   // the main stream at high priority without --batch too (measured: decode +1.4% on a short answer, +3.5% on a
+        // long one); BASALT_MAIN_HIGH=0 keeps it for --batch only
+        const char* mh = std::getenv("BASALT_MAIN_HIGH");
+        ver.set_main_priority(o.batch > 0 || !(mh != nullptr && mh[0] == '0'));   // beside a prompt read the slots' windows must win the SMs
+    }
     if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
     for (const auto& xpe : xpeers)
         if (xpe->valid()) ver.add_peer(xpe.get());

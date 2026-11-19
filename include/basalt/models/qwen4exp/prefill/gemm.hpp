@@ -66,6 +66,12 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    // the FP16 images of a BF16 product's W (whole) and X (row blocks) on a Volta card
+    void* wh_ = nullptr;
+    void* xh_ = nullptr;
+    int64_t wh_elems_ = 0, xh_elems_ = 0;
+    bool f16_failed_ = false;
+    bool f16_images(int64_t w_elems, int64_t x_elems);
 };
 
 

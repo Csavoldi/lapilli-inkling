@@ -268,6 +268,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             gr_read_group(1, true, v_.inj_, v_.inj2_);
         }
     }
+    stamp(l, 31);   // profile: the second read done
     if (sh_fork) {
         cudaEventRecord(v_.ev_fork_, cs);
         cudaStreamWaitEvent(sh_stream, v_.ev_fork_, 0);
@@ -282,6 +283,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) w_router->data, v_.logits_, NE, N,
                                       NE, n, cs);
             native_router_top10_multi(v_.logits_, v_.ids_, v_.w_, n, cs);
+            stamp(l, 32);   // profile: the router done (GEMV + top 10)
         } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
     } else
     for (int t = 0; t < T; ++t) {

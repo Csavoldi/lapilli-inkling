@@ -17,6 +17,7 @@
 #pragma once
 
 #include "window_gemm.cuh"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels::wgemm::detail {
 
@@ -37,7 +38,7 @@ struct SlicedCfg {
 
 template <int N> __device__ __forceinline__ void cp_async_ca(void* smem, const void* gmem) {
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::"r"(s), "l"(gmem), "n"(N));
+    basalt::volta::cp_async_ca<N>(s, gmem);
 }
 
 // One block's 16 rows: tile `tile` of the call's tiles.

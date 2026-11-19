@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace basalt::kernels {
@@ -96,6 +97,64 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
+// `route`'s selection and weights, bit for bit; the taken positions are kept in a mask (a taken position reads as
+// -INFINITY, which `route` writes into values[]), so values[] stays in registers; one warp a block
+__launch_bounds__(32)
+__global__ void route_v2(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights) {
+    pdl_wait();
+    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
+    const int lane = threadIdx.x;
+    float values[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+    maximum = warp_max(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = expf(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] *= reciprocal;
+        if (__isnanf(values[i])) values[i] = -FLT_MAX;
+    }
+    unsigned taken = 0u;
+    float selected = 0.0f, selected_sum = 0.0f;
+    for (int rank = 0; rank < 10; ++rank) {
+        float best = (taken & 1u) ? -INFINITY : values[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < 16; ++i) {
+            const float v = (taken >> i & 1u) ? -INFINITY : values[i];
+            if (v > best) { best = v; expert = lane + i * 32; }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        if ((expert & 31) == lane) {
+            taken |= 1u << (expert >> 5);
+            ids[rank] = expert;
+            selected_sum += best;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
+// `route` only with BASALT_ROUTE_V1=1, read at every call (the parity test compares the two)
+bool route_v1() {
+    const char* e = std::getenv("BASALT_ROUTE_V1");
+    return e != nullptr && e[0] == '1';
 }
 // The residency-biased router: the weights are `route`'s, the selection ranks the resident experts' probabilities times
 // `boost`. One warp a token.
@@ -203,7 +262,8 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    if (route_v1()) route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    else route_v2<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -211,7 +271,8 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
-    launch_pdl(route, dim3((unsigned) n_tok), dim3(32, 8), 0, static_cast<cudaStream_t>(stream), logits, ids, weights);
+    if (route_v1()) launch_pdl(route, dim3((unsigned) n_tok), dim3(32, 8), 0, static_cast<cudaStream_t>(stream), logits, ids, weights);
+    else launch_pdl(route_v2, dim3((unsigned) n_tok), dim3(32), 0, static_cast<cudaStream_t>(stream), logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

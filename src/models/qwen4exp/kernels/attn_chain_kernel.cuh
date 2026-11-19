@@ -1,3 +1,4 @@
+#include "basalt/kernels/volta_compat.cuh"
 namespace mkc {
 
 constexpr int NJ = 10;   // uint4 of bf16 per lane in a 2560-wide alpha/beta row
@@ -92,7 +93,7 @@ __device__ __forceinline__ void pf_l2(const void* p, size_t n) {   // n multiple
 #pragma unroll 1
     for (size_t o = 0; o < n; o += 32768) {
         const unsigned sz = (unsigned) (n - o < 32768 ? n - o : 32768);
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(c + o), "r"(sz) : "memory");
+        basalt::volta::bulk_prefetch_l2(c + o, sz);
     }
 }
 

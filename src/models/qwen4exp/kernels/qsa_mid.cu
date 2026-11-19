@@ -2,6 +2,7 @@
 //
 // Its own translation unit: dense_tc.cu's device code without its host side.  Built WITHOUT fast math, like it.
 #define FZ_DEV_ONLY
+#include "basalt/kernels/volta_smem.hpp"
 #include "dense_tc.cu"
 #include "basalt/models/qwen4exp/kernels/qsa_mid.hpp"
 #include "smem_opt_in.cuh"
@@ -164,7 +165,7 @@ void launch_half(const void* w, const void* x, float* y, int n_in, int n_out, in
     static std::atomic<bool> attr[64];
     const int dev = opt_in_device("qsa_qproj_half");
     if (!attr[dev].load(std::memory_order_acquire)) {
-        opt_in_check(cudaFuncSetAttribute(qproj_half_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
+        opt_in_check(cudaFuncSetAttribute(qproj_half_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, basalt::volta::smem_ceiling(99 * 1024)),
                      "qsa_qproj_half");
         attr[dev].store(true, std::memory_order_release);
     }

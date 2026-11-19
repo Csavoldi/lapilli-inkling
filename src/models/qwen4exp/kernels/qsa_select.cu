@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -169,14 +170,11 @@ constexpr int TC_KS = IDX_DIM + 4;               // key row stride
 
 __device__ __forceinline__ uint32_t tf32_hi(float x) {
     uint32_t r;
-    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    (r = basalt::volta::cvt_rna_tf32(x));
     return r;
 }
 __device__ __forceinline__ void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    basalt::volta::mma_1688_f32_tf32(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3]);
 }
 
 __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __restrict__ pooled,

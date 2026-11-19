@@ -47,9 +47,16 @@ bool Prefill::Run::Chunk::Experts::Group::group() {
     // layer's kernels that read them)
     if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
     else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+    // with the peer's sums, the routing weights come down too (the same sync), to weigh its rows
+    const bool peer_sums = ppc && ppc->share && ppc->share->combines() && pre_mmq;
+    if (peer_sums) cudaMemcpyAsync(m.w_host.data(), m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+    // the peer's activations leave now, behind the routing's copy (which the host waits for below): they overlap that wait
+    // and the grouping without delaying it (the same bytes PeerShare::run would send)
+    if (ppc && ppc->share && !stream_all && use_mmq && pre_mmq && T < early_act_upmix_min())   // larger chunks send them after up_mix
+        ppc->share->send_activations(mmq_gt, m.mixed, (int) T, m.cs);
     // CPU share (small chunks, experts with a host copy): the layer's activations go to the host on
     // their own stream while the routing is read
-    if (!cpu_download()) return false;
+    if (!(cpu_late_on() ? cpu_mark() : cpu_download())) return false;   // cpu_late_on: copied later (cpu_download_late)
     // a stall here is the GPU (this layer's attention and router, or the previous layer's
     // work), not the host: the watchdog's report says so (only its text changes)
     core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
@@ -106,6 +113,8 @@ bool Prefill::Run::Chunk::Experts::Group::group() {
         slot_h[(size_t) i] = p;
         src_h[(size_t) p] = (int32_t) (i / K);
     }
+    if (peer_sums)   // each row's weight, in Dm's row order
+        for (int64_t i = 0; i < T * K; ++i) m.wrow_host[(size_t) slot_h[(size_t) i]] = m.w_host[(size_t) i];
     if (grp_mapped) {
         copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
         copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);

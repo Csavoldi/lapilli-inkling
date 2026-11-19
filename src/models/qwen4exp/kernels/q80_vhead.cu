@@ -4,6 +4,11 @@
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#define BASALT_REDUCE_ADD(m, v) basalt::volta::reduce_add_sync((m), (v))
+#else
+#define BASALT_REDUCE_ADD(m, v) __reduce_add_sync((m), (v))
+#endif
 #include "q80p.cuh"
 #include "smem_opt_in.cuh"
 
@@ -428,7 +433,7 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
 #pragma unroll
         for (int i = 0; i < VHIST / 32; ++i) v[i] = __ldcg(&vs->hist[c][i * 32 + lane]);
 #pragma unroll
-        for (int i = 0; i < VHIST / 32; ++i) tot[i] = __reduce_add_sync(0xffffffffu, v[i]);
+        for (int i = 0; i < VHIST / 32; ++i) tot[i] = BASALT_REDUCE_ADD(0xffffffffu, v[i]);
         unsigned run = 0, row_v = 0;
         int rw = -1;
 #pragma unroll

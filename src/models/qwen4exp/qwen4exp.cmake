@@ -5,6 +5,12 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/ngram.cpp
   src/models/qwen4exp/kernels/dec_moe.cu
   src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m0_b2.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m1_b2.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m0_b3.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m1_b3.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m0_b1.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m1_b1.cu
   src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
   src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
   src/models/qwen4exp/kernels/dec_moe_peer_q1_m1.cu

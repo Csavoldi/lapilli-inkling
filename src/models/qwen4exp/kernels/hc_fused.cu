@@ -3,6 +3,7 @@
 // Built WITHOUT fast math, like fused_gr.cu, so the hc arithmetic below is fused_gr.cu's expressions compiled the
 // same way.  The router part reproduces kernels built WITH fast math (the MMVF GEMV and the native top-10): those
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/core/diag.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -187,39 +188,39 @@ static_assert(offsetof(HcLaunch, tm) % 64 == 0, "the TMA descriptors must sit on
 // ---------------------------------------------------------------- primitives
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint64_t* bar, unsigned count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count) : "memory");
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    BASALT_SM90_ASM("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count) : "memory");
+    BASALT_SM90_ASM("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, unsigned bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
+    BASALT_SM90_ASM("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned ph) {
     unsigned done = 0;
     while (!done) {
-        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+        BASALT_SM90_ASM("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
                      : "=r"(done) : "r"(smem_u32(bar)), "r"(ph) : "memory");
     }
 }
 __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");
+    BASALT_SM90_ASM("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");
 }
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+    BASALT_SM90_ASM("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
 }
 // A 2D tensor copy (box of the map) at element coordinates (x, y) into shared memory, completing on bar.
 __device__ __forceinline__ void tma_2d(void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+    BASALT_SM90_ASM("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar))
                  : "memory");
 }
 __device__ __forceinline__ void tma_3d(void* dst, const CUtensorMap* map, int x, int y, int z, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+    BASALT_SM90_ASM("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
                  ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(smem_u32(bar))
                  : "memory");
 }
 __device__ __forceinline__ void tma_4d(void* dst, const CUtensorMap* map, int x, int y, int z, int w, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5}], [%6];"
+    BASALT_SM90_ASM("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5}], [%6];"
                  ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_u32(bar))
                  : "memory");
 }
@@ -227,7 +228,7 @@ __device__ __forceinline__ void prefetch_l2(const void* p, size_t bytes) {   // 
     const char* c = (const char*) p;
     for (size_t o = 0; o < bytes; o += 65536) {
         const unsigned sz = (unsigned) (bytes - o < 65536 ? bytes - o : 65536);
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(c + o), "r"(sz) : "memory");
+        basalt::volta::bulk_prefetch_l2(c + o, sz);
     }
 }
 // DBG: the bench's phase times (a separate instantiation of the kernel); otherwise no code at all
@@ -658,9 +659,7 @@ __device__ void hc_up_rout(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
 // (2 t4 + 8, 2 t4 + 9), so a token's lo loads as one float4 per half.  lo is split into f16 hi + lo parts; each
 // group's sums are scaled by their row's scale into the fp32 total.
 __device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_f16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1, c[0], c[1], c[2], c[3]);
 }
 __device__ __forceinline__ void split_f16(float a, float b, uint32_t& hi, uint32_t& lo) {
     const __half2 h = __floats2half2_rn(a, b);
@@ -696,8 +695,7 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
 #pragma unroll
     for (int s = 0; s < NG8; ++s) {
         uint32_t q[4];
-        asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-            : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "r"(addr + s * ks));
+        basalt::volta::ldmatrix_x4<false>(q[0], q[1], q[2], q[3], addr + s * ks);
         float gh[4] = {0.f, 0.f, 0.f, 0.f}, gl[4] = {0.f, 0.f, 0.f, 0.f};   // the group's hi and lo chains
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -1039,7 +1037,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 while (ld_acquire(&sy->down.v) < (unsigned) CN_ND) {}
                 stamp<DBG>(dbg, b, 11, 0);
                 if (lst) {
-                    asm volatile("fence.proxy.async;" ::: "memory");
+                    BASALT_SM90_ASM("fence.proxy.async;" ::: "memory");
                     mbar_expect_tx(&lbar, lst_p + lst_s);
                     bulk_g2s(lsm, L.cnp, lst_p, &lbar);
                     bulk_g2s(lsm + T * CN_HS * CN_ROWS, L.cns, lst_s, &lbar);

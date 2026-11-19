@@ -11,6 +11,7 @@
 //   gdn_chunk_parity [seed]          the checks
 //   gdn_chunk_parity --bench         and the timings at T = 4096, 16384 and 32768 (one layer), old and new alternating
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -41,14 +42,15 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 // ------------------------------------------------------------------ the kernel before (verbatim)
+// through volta_compat.cuh (synchronous copies on V100, the same cp.async elsewhere)
 __device__ __forceinline__ void gdn_cp4(float* smem, const float* gmem) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
+    basalt::volta::cp_async_ca<4>((unsigned) __cvta_generic_to_shared(smem), gmem);
 }
 __device__ __forceinline__ void gdn_cp16(float* smem, const float* gmem) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
+    basalt::volta::cp_async_cg16((unsigned) __cvta_generic_to_shared(smem), gmem);
 }
-__device__ __forceinline__ void gdn_cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void gdn_cp_wait_prev() { asm volatile("cp.async.wait_group 1;\n" ::); }
+__device__ __forceinline__ void gdn_cp_commit() { basalt::volta::cp_async_commit(); }
+__device__ __forceinline__ void gdn_cp_wait_prev() { basalt::volta::cp_async_wait<1>(); }
 constexpr int VPK = HV / HK;
 constexpr int GDN_WC = 16, GDN_WNCB = S / GDN_WC, GDN_WTB = 16;
 __global__ void __launch_bounds__(GDN_WC * 8) gdn_rec_wl_kernel(float* __restrict__ state, const float* __restrict__ h,

@@ -1,5 +1,6 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "basalt/core/vmm.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -178,7 +179,8 @@ int sessions(Context& context) {
     // whole base out of the expert cache.
     constexpr int64_t kKvElasticFloor = 32768, kKvElasticFloorBatch = 4096;
     const int64_t kv_base = o.batch > 0 ? kKvElasticFloorBatch : kKvElasticFloor;
-    const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
+    // The elastic KV (segments, KvArena) needs the driver's virtual memory management.
+    const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic && basalt::core::vmm::supported() &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A

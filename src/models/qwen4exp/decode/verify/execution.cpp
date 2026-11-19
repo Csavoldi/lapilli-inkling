@@ -17,6 +17,7 @@
 #include "basalt/kernels/wait_abort.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -28,6 +29,18 @@
 
 namespace basalt::core {
 using namespace verify_detail;
+
+// CPU sensitivity diagnostic (is the host's expert work on the critical path?): BASALT_CPU_DELAY_US=N (0 to 1000) raises
+// each layer's flag N us later
+static int cpu_delay_us() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_CPU_DELAY_US");
+        const int n = (e != nullptr && *e != 0) ? std::atoi(e) : 0;
+        v = n < 0 ? 0 : n > 1000 ? 1000 : n;
+    }
+    return v;
+}
 
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     using namespace basalt::kernels;
@@ -286,6 +299,10 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             ms_host += ms_since(tp);
+        }
+        if (const int dly = cpu_delay_us(); dly > 0) {   // CPU sensitivity diagnostic (BASALT_CPU_DELAY_US)
+            const Clock::time_point td = Clock::now();
+            while (Clock::now() - td < std::chrono::microseconds(dly)) _mm_pause();
         }
         *flag = want;
         if (dm_ != nullptr && dm_->warm != nullptr && l + 1 < le_) {   // the next layer's warm-up

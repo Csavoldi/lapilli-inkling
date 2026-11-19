@@ -7,4 +7,11 @@ const void* dm_peer_fn_q0_m0();
 const void* dm_peer_fn_q0_m1();
 const void* dm_peer_fn_q1_m0();
 const void* dm_peer_fn_q1_m1();
+// The variants without Q2_0 at 2 and 3 blocks per SM at least (BASALT_PEER_MINB)
+const void* dm_peer_fn_q0_m0_b2();
+const void* dm_peer_fn_q0_m1_b2();
+const void* dm_peer_fn_q0_m0_b3();
+const void* dm_peer_fn_q0_m1_b3();
+const void* dm_peer_fn_q0_m0_b1();   // and at 1 block per SM at least
+const void* dm_peer_fn_q0_m1_b1();
 }  // namespace basalt::kernels

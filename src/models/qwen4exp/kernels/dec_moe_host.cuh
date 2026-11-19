@@ -1,9 +1,21 @@
 // src/models/qwen4exp/kernels/dec_moe_host.cuh - the decode MoE tail's launchers, on dec_moe.cuh and dec_moe_kernels.cuh (one TU: dec_moe.cu).
 #pragma once
 
+#include <cstdlib>
+
 namespace basalt::kernels {
 
 int dec_moe_route_blocks(int n_tok, int n_embd) { return 1 + (n_tok * n_embd + kDmThreads - 1) / kDmThreads; }
+
+// BASALT_DM_ROUTE_V1=1 runs the route kernel's original version (dm_route_kernel<false>)
+bool dm_route_v1() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_DM_ROUTE_V1");
+        v = (e != nullptr && *e != 0 && std::atoi(e) != 0) ? 1 : 0;
+    }
+    return v == 1;
+}
 
 void dec_moe_route(const DmRouteArgs& a, void* stream) {
     if (a.n_tok * a.k > kDmCap || a.n_embd % kDmThreads != 0) {
@@ -11,7 +23,8 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
         std::exit(1);
     }
     const dim3 grid((unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd));
-    dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    if (dm_route_v1()) dm_route_kernel<false><<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    else dm_route_kernel<true><<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
     check("dec_moe_route");
 }
 
@@ -284,7 +297,20 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, i
     return pair && gu && d && n_ff == 640 && n_embd % 256 == 0 && !iq_old_kernels() && !native_grouped_v1();
 }
 
+// BASALT_PEER_MINB=1, 2 or 3: the variant without Q2_0 at that many blocks an SM at least (read once)
+static int dm_peer_minb() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_PEER_MINB");
+        const int m = (e != nullptr && *e != 0) ? std::atoi(e) : 2;   // 2 by default
+        v = (m == 1 || m == 2 || m == 3) ? m : 4;   // any other value: 4, upstream's bound
+    }
+    return v;
+}
 static const void* dm_peer_fn(bool q2, bool mix = false) {
+    if (!q2 && dm_peer_minb() == 1) return mix ? dm_peer_fn_q0_m1_b1() : dm_peer_fn_q0_m0_b1();
+    if (!q2 && dm_peer_minb() == 2) return mix ? dm_peer_fn_q0_m1_b2() : dm_peer_fn_q0_m0_b2();
+    if (!q2 && dm_peer_minb() == 3) return mix ? dm_peer_fn_q0_m1_b3() : dm_peer_fn_q0_m0_b3();
     if (mix) return q2 ? dm_peer_fn_q1_m1() : dm_peer_fn_q0_m1();
     return q2 ? dm_peer_fn_q1_m0() : dm_peer_fn_q0_m0();
 }
@@ -301,9 +327,28 @@ int dec_moe_peer_blocks(bool q2) {
     return sms * per;
 }
 
+// BASALT_PEER_U5: bit 2 of gu2, dm_row_dot's unrolled gate/up row (the kernel's own test stays `gu2 != 0`)
+static bool dm_peer_u5() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_PEER_U5");
+        v = (e != nullptr && *e != 0 && std::atoi(e) == 0) ? 0 : 1;   // on by default; BASALT_PEER_U5=0 turns it off
+    }
+    return v == 1;
+}
+// BASALT_PEER_DELAY_US=N (0 to 255): bits 8 to 15 of gu2, block 0 waits N us after each doorbell (latency test)
+static int dm_peer_delay_us() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_PEER_DELAY_US");
+        const int n = (e != nullptr && *e != 0) ? std::atoi(e) : 0;
+        v = n < 0 ? 0 : n > 255 ? 255 : n;
+    }
+    return v;
+}
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2) {
     DmPeerArgs args = a;
-    args.gu2 = 1;
+    args.gu2 = (dm_peer_u5() ? 5 : 1) | (dm_peer_delay_us() << 8);
     void* params[] = {&args};
     const cudaError_t e = cudaLaunchCooperativeKernel(dm_peer_fn(q2, a.mixl != nullptr),
                                                       dim3((unsigned) blocks),

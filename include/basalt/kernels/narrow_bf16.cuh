@@ -7,6 +7,7 @@
 // tests/kernels/narrow_bf16_parity.cu compares the two ways on every input.
 #pragma once
 
+#include "basalt/kernels/volta_sm100.hpp"
 #include <cuda_runtime.h>
 
 #if defined(__CUDACC_VER_MAJOR__) && \
@@ -21,7 +22,7 @@ namespace basalt::kernels {
 /// f16x2 as bf16x2, for values bf16 holds exactly (each half through f32)
 __device__ __forceinline__ unsigned f16x2_bf16x2(unsigned f) {
     unsigned h;
-    asm("{\n"
+    BASALT_SM100_ASM("{\n"
         ".reg .f16 l, u;\n"
         ".reg .f32 a, b;\n"
         "mov.b32 {l, u}, %1;\n"
@@ -38,14 +39,14 @@ __device__ __forceinline__ unsigned f16x2_bf16x2(unsigned f) {
 __device__ __forceinline__ unsigned e4m3x2_bf16x2_via_f16(unsigned x) {
     unsigned f;
     const unsigned short v = (unsigned short) x;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f) : "h"(v));
+    BASALT_SM100_ASM("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f) : "h"(v));
     return f16x2_bf16x2(f);
 }
 
 /// the four bytes of w, each two E2M1 codes (the low nibble the lower half), as bf16x2 through f16x2
 __device__ __forceinline__ void e2m1x8_bf16x2_via_f16(unsigned w, unsigned (&h)[4]) {
     unsigned f[4];
-    asm("{\n"
+    BASALT_SM100_ASM("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
         "mov.b32 {b0, b1, b2, b3}, %4;\n"
         "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
@@ -64,7 +65,7 @@ __device__ __forceinline__ unsigned e4m3x2_bf16x2(unsigned x) {
 #if BASALT_CVT_BF16X2_NARROW
     unsigned h;
     const unsigned short v = (unsigned short) x;
-    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
+    BASALT_SM100_ASM("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
     return h;
 #else
     return e4m3x2_bf16x2_via_f16(x);
@@ -75,7 +76,7 @@ __device__ __forceinline__ unsigned e4m3x2_bf16x2(unsigned x) {
 /// a code times a UE4M3 scale has at most five significant bits)
 __device__ __forceinline__ void e2m1x8_bf16x2_scaled(unsigned w, unsigned sc, unsigned (&h)[4]) {
 #if BASALT_CVT_BF16X2_NARROW
-    asm("{\n"
+    BASALT_SM100_ASM("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
         ".reg .b32 t0, t1, t2, t3;\n"
         "mov.b32 {b0, b1, b2, b3}, %4;\n"
@@ -94,7 +95,7 @@ __device__ __forceinline__ void e2m1x8_bf16x2_scaled(unsigned w, unsigned sc, un
     unsigned t[4];
     e2m1x8_bf16x2_via_f16(w, t);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(h[i]) : "r"(t[i]), "r"(sc));
+    for (int i = 0; i < 4; ++i) BASALT_SM100_ASM("mul.rn.bf16x2 %0, %1, %2;" : "=r"(h[i]) : "r"(t[i]), "r"(sc));
 #endif
 }
 

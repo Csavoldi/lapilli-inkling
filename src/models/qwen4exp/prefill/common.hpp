@@ -7,6 +7,8 @@
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cuda_runtime.h>
 #include <string>
 
 namespace basalt::prefill::detail {
@@ -42,6 +44,37 @@ constexpr int kPrefillRingDeep = 384;
 constexpr int64_t kDeepRingTokens = 16384;
 extern int g_ring_depth;
 bool fused_ring();
+// BASALT_COPY_AHEAD=0 turns off the next layer's routing guess and the copies ahead of it (ahead.cpp), =1 forces them;
+// unset, off on a Volta card (sm_70 to sm_74, the current card at the first call: the primary), where the attention's
+// kernels run 2 to 3 times slower beside those copies (measured on 2x V100), on elsewhere
+inline bool copy_ahead_on() {
+    static const int env = [] {
+        const char* e = std::getenv("BASALT_COPY_AHEAD");
+        return e == nullptr ? -1 : (e[0] == '0' ? 0 : 1);
+    }();
+    if (env >= 0) return env == 1;
+    static const bool volta = [] {
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        const int c = 10 * major + minor;
+        return c >= 70 && c < 75;
+    }();
+    return !volta;
+}
+// A routed chunk of at least this many tokens sends the peer's activations right after up_mix (it waits for the peer), a
+// smaller one behind the routing's copy (it waits for the main card's own experts); BASALT_PEER_EARLY_UPMIX_MIN, default 2560
+inline int64_t early_act_upmix_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("BASALT_PEER_EARLY_UPMIX_MIN");
+        return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 2560;
+    }();
+    return v;
+}
 // (a prompt peer's streamed share and the fused kernels' batches follow the ring's size: those keep 256)
 inline int ring_slots(size_t T) {
     if ((int64_t) T < stream_all_min()) return std::min(g_ring_depth, STAGE + 2 * ahead_slots(T));

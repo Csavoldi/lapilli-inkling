@@ -221,6 +221,11 @@ void run_card(const Card& k, int T, cudaStream_t s) {
     a.state = k.state; a.qkv = k.qkv; a.conv_w = k.conv_w; a.x = k.x; a.w_alpha = k.wa; a.w_beta = k.wb;
     a.dt = k.dt; a.ssm_a = k.ssm_a; a.z = k.z; a.gamma = k.gamma; a.h = k.h; a.gate = k.gate; a.beta = k.beta;
     a.yq = k.yq; a.C = k.c; a.n_embd = N; a.h_k = k.hk; a.h_v = k.hv; a.eps = EPS; a.early_trigger = false;
+    {   // the output buffer of the cluster-free path, one per card (never freed: the test exits)
+        static float* o_scr[8] = {};
+        if (o_scr[k.dev & 7] == nullptr) CK(cudaMalloc(&o_scr[k.dev & 7], (size_t) kVerifyMaxT * 4 * (size_t) S * 64 * sizeof(float)));
+        a.o = o_scr[k.dev & 7];
+    }
     dec_gdn_rec(a, T, s);
     native_mmvq(k.to, k.wo, k.yq, k.out, k.zv, N, T, s);
 }
@@ -634,10 +639,9 @@ int main(int argc, char** argv) {
     CK(cudaGetDeviceCount(&ndev));
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, 0));
-    if (p.major < 9) {
-        std::printf("gdn_head_split_parity: needs thread-block clusters (compute capability %d.%d)\n", p.major, p.minor);
-        return 77;
-    }
+    // without clusters, dec_gdn_rec runs split + norm (a.o set by run_card)
+    if (p.major < 9)
+        std::printf("gdn_head_split_parity: no thread-block clusters (compute capability %d.%d): dec_gdn_rec runs split + norm\n", p.major, p.minor);
     g_dev1 = ndev > 1 ? 1 : 0;
     std::printf("gdn_head_split_parity: rank 0 on card 0, the peer on card %d (%d cards)\n", g_dev1, ndev);
     const std::string mode = argc > 1 ? argv[1] : "";

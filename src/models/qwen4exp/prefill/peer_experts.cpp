@@ -85,6 +85,7 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             x.blob = P.peer->slot_ptr(l, e);
             x.on_peer = true;
             x.tok = src_h + m.off[(size_t) e];
+            if (P.share->combines()) x.w = m.wrow_host.data() + m.off[(size_t) e];
             x.n = (int) c;
             x.group = j == 0 || j - g0 == (size_t) MMQ_GROUP || gr + c > P.G;
             if (x.group) {
@@ -119,7 +120,12 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             mmq::swiglu(gu, h, lv.rows, 640, !native, stream, sc, lv.bounds, lv.n);
         };
     }
-    return P.share->run(L, m.mixed, (int) T, ex, m.Dm + (size_t) rows_local * N, m.cs, err);
+    // with the sums, the peer's block of Dm stays unwritten and its sums land in bo (free until the combine)
+    const bool sums = P.share->combines();
+    experts.peer_sum = sums;
+    experts.peer_sum_row0 = rows_local;
+    experts.peer_sum_rows = rows_peer;
+    return P.share->run(L, m.mixed, (int) T, ex, sums ? m.bo : m.Dm + (size_t) rows_local * N, m.cs, err);
 }
 
 }  // namespace basalt::prefill

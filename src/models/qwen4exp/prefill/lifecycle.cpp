@@ -102,6 +102,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.steps_host.resize(T * basalt::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    m.w_host.resize(T * K); m.wrow_host.resize(T * K);   // the routing weights, and per row of Dm
     {
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
         if (m.grp_n < need) {

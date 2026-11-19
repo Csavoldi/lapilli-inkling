@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 using gdn_dev::CommitPre;
@@ -459,7 +460,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
             const uint64_t take = min(min(o1 - o, pf.n[r] - ro), (uint64_t) 32768);
             const char* src = (const char*) pf.p[r] + ro;
             if (take >= 16) {
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) (take & ~15ull)) : "memory");
+                basalt::volta::bulk_prefetch_l2(src, (unsigned) (take & ~15ull));
                 last = src + (take & ~15ull) - 16;
             }
             o += take;

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -113,39 +114,29 @@ int decode_splits(int64_t n_chunks) { return (int) std::max<int64_t>(1, std::min
 // ---------------------------------------------------------------- prompt: shared helpers
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x2(unsigned& r0, unsigned& r1, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(smem_u32(p)));
+    basalt::volta::ldmatrix_x2<false>(r0, r1, smem_u32(p));
 }
 __device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+    basalt::volta::ldmatrix_x4<false>(r0, r1, r2, r3, smem_u32(p));
 }
 __device__ __forceinline__ void ldsm_x4_t(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+    basalt::volta::ldmatrix_x4<true>(r0, r1, r2, r3, smem_u32(p));
 }
 __device__ __forceinline__ void mma16816(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_f16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3]);
 }
 __device__ __forceinline__ void mma16816_h(unsigned (&c)[2], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                            unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c[0]), "+r"(c[1])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f16_f16(c[0], c[1], a0, a1, a2, a3, b0, b1, c[0], c[1]);
 }
 __device__ __forceinline__ void mma16832_s8(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                             unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_16832_s32_s8<false>(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3]);
 }
 
 __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(smem_u32(p)));
+    basalt::volta::ldmatrix_x2<true>(r0, r1, smem_u32(p));
 }
 
 // ---------------------------------------------------------------- decode on the tensor cores
@@ -365,19 +356,17 @@ void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n
 
 __device__ __forceinline__ void mma16832_u8s8(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                               unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_16832_s32_s8<true>(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3]);
 }
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const unsigned*>(&h);
 }
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool ok) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 16 : 0));
+    basalt::volta::cp_async_cg16(smem_u32(dst), src, ok ? 16 : 0);
 }
 __device__ __forceinline__ void cp8(void* dst, const void* src, bool ok) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 8 : 0));
+    basalt::volta::cp_async_ca<8>(smem_u32(dst), src, ok ? 8 : 0);
 }
 __device__ __forceinline__ float h2f(uint16_t u) { return __half2float(__ushort_as_half(u)); }
 __device__ __forceinline__ float ex2(float x) {   // 2^x, -inf -> 0
@@ -457,7 +446,7 @@ __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __res
             cp16(&sm.k[r][c], (fa ? (const __half*) far_kv.k : kc) + row * HD + c, ok);
             cp16(&sm.v[r][c], (fa ? (const __half*) far_kv.v : vc) + row * HD + c, ok);
         }
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+        (basalt::volta::cp_async_commit(), basalt::volta::cp_async_wait<0>());
         __syncthreads();
 
         // S = Q K^T for the warp's 16 rows and the tile's 32 cells (four 8-cell tiles)
@@ -662,7 +651,7 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restri
             if (tid < I8BC) cp8(ks_s + key * G4, c8.ks + src, ok);
             else cp8(vs_s + key * G4, c8.vs + src, ok);
         }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        basalt::volta::cp_async_commit();
     };
 
     const int a_mat = lane >> 3, a_rin = lane & 7;
@@ -686,7 +675,7 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restri
     if (kb_begin < kb_end) issue_tile(kb_begin);
 #pragma unroll 1
     for (int kb = kb_begin; kb < kb_end; ++kb) {
-        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        basalt::volta::cp_async_wait<0>();
         __syncthreads();   // tile kb is in, and every warp is done with the other stage
         if (kb + 1 < kb_end) issue_tile(kb + 1);
         const int k0 = kb * I8BC;

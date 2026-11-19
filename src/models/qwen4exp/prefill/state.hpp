@@ -69,6 +69,7 @@ struct Prefill::Impl {
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    std::vector<float> w_host, wrow_host;   // the routing weights [T * K], then per row of Dm
     // The CPU share of a small chunk's experts: the layer's normalized activations and the pool's output rows (pinned),
     // the pool's per-token activations and jobs, the stream and events that bring the activations to the host, and the
     // running per-expert costs the share is balanced from.

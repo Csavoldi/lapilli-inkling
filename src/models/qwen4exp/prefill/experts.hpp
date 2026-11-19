@@ -20,6 +20,10 @@
 namespace basalt::prefill {
 using namespace detail;
 
+// the CPU share's activations go down only when the CPU takes experts, after the peer's (BASALT_CPU_X_LATE=0: upstream's
+// order, at the routing read)
+bool cpu_late_on();
+
 struct Prefill::Run::Chunk::Experts {
     struct Group;
     Experts(Chunk& chunk, int64_t l) : chunk(chunk), l(l) {}
@@ -102,6 +106,9 @@ struct Prefill::Run::Chunk::Experts {
     const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt, mmq_ut);
     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
+    // the peer summed its rows (Dm rows [peer_sum_row0, + peer_sum_rows) unwritten, its sums in bo)
+    bool peer_sum = false;
+    int64_t peer_sum_row0 = 0, peer_sum_rows = 0;
     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
     // reads on_cpu, so the future (which waits for the thread) is declared after it
     std::vector<char> on_cpu;
@@ -115,6 +122,8 @@ struct Prefill::Run::Chunk::Experts::Group {
     bool execute();
     bool group();
     bool cpu_download();
+    bool cpu_mark();
+    bool cpu_download_late();
     void cpu_select();
     bool cpu_start();
     void prepare_products();

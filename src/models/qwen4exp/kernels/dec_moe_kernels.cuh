@@ -7,16 +7,34 @@ namespace {
 // Block 0 plans CUDA0's groups and publishes the ring's header; the other blocks quantize the FFN input (256 values
 // each) into the device q8_1 rows and, for the tiers that need them, into mapped memory.  The last block to finish
 // rings both doorbells.  Mode 1 keeps only the plan and the device rows, mode 2 only the ring (DmRouteArgs::mode).
+// V2: the same plan in fewer memory round trips; V2 = false: the upstream code
+template <bool V2>
 __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap];
     __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne, s_nx[kDmMaxX];
+    __shared__ __align__(16) int32_t s_key[kDmCap];   // V2: the keys for dm_group_keys (the id of a CUDA0 entry, -1 otherwise)
     if (a.sh_gw != nullptr) pdl_trigger();   // the next kernel may start (only weights before its wait)
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     pdl_wait();   // DEC_PDL2: launched during the router's tail
+    if (V2 && blockIdx.x == 0 && tid < 32 && tid * 32 < a.n_expert) {   // V2: the layer's residency rows (res0, res1) prefetched into L2
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(a.res0 + tid * 32));
+        if (a.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.res1 + tid * 32));
+    }
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
     if (tid < kDmMaxX) s_nx[tid] = 0;
-    if (tid < n) s_ids[tid] = a.ids[tid];
+    // V2: each entry's id, then its two residency words together and (block 0, the plan) its slot's offset, before the barrier
+    int32_t my_r0 = -1, my_r1 = -1;
+    unsigned long long my_off = 0ull;
+    if (tid < n) {
+        const int32_t my_e = a.ids[tid];
+        s_ids[tid] = my_e;
+        if (V2 && my_e >= 0 && my_e < a.n_expert) {
+            my_r0 = a.res0[my_e];
+            my_r1 = a.res1 != nullptr ? a.res1[my_e] : -1;
+            if (blockIdx.x == 0 && a.mode != 2 && a.slot_off != nullptr && my_r0 >= 0) my_off = a.slot_off[my_r0];
+        }
+    }
     __syncthreads();
     if (tid < n) {
         const int32_t e = s_ids[tid];
@@ -24,7 +42,19 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         // one entry per token (kDmMaxEnt, the persistent kernels' shared rows)
         bool ok = e >= 0 && e < a.n_expert;
         for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        s_kind[tid] = ok ? dm_tier(a, e) : -1;
+        if (V2) {   // dm_tier's order: CUDA0, the peer, the further cards, the CPU
+            int kd = -1;
+            if (ok) {
+                if (my_r0 >= 0) kd = 0;
+                else if (my_r1 >= 0) kd = 2;
+                else
+                    for (int q = 0; q < a.n_x; ++q)
+                        if (a.xres[q][e] >= 0) { kd = 3 + q; break; }
+            }
+            s_kind[tid] = kd;
+        } else {
+            s_kind[tid] = ok ? dm_tier(a, e) : -1;
+        }
     }
     __syncthreads();
     if (a.peer_cap > 0) {   // the peer's groups past peer_cap (distinct ids in routing order) go to the CPU pool
@@ -76,17 +106,26 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         dm_xring_headers(a, s_ids, s_kind, n, tid, s_nx, ne, s_ncpu);
     } else if (blockIdx.x == 0) {
         DmPlan* p = a.plan;
-        dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, p->start, &s_ng, &s_ne);
+        if (V2) {   // dm_group_keys (the same groups, at the same places as dm_group)
+            if (tid < kDmCap) s_key[tid] = tid < n && s_kind[tid] == 0 ? s_ids[tid] : -1;
+            __syncthreads();
+            int first = tid, rank = 0;
+            dm_group_keys(s_key, n, tid, s_first, s_cnt, s_gstart, s_gidx, p->start, &s_ng, &s_ne, first, rank);
+            if (tid < kDmCap) s_pos[tid] = tid < n && s_kind[tid] == 0 ? s_gstart[first] + rank : -1;
+            __syncthreads();
+        } else {
+            dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, p->start, &s_ng, &s_ne);
+        }
         if (tid < n) {
             const int32_t kd = s_kind[tid];
             p->kind[tid] = kd;
             if (kd == 0) {
                 p->dst[s_pos[tid]] = tid;
                 p->tok[s_pos[tid]] = tid / a.k;
-                if (s_first[tid]) {
-                    const int32_t slot = a.res0[s_ids[tid]];
-                    p->ptr[s_gidx[tid]] = (unsigned long long) (a.cache_base + (a.slot_off ? (size_t) a.slot_off[slot]
-                                                                                              : (size_t) slot * (size_t) a.blob));
+                if (s_first[tid]) {   // V2: the slot and its offset read at the start (the same words)
+                    const int32_t slot = V2 ? my_r0 : a.res0[s_ids[tid]];
+                    const size_t off = a.slot_off ? (size_t) (V2 ? my_off : a.slot_off[slot]) : (size_t) slot * (size_t) a.blob;
+                    p->ptr[s_gidx[tid]] = (unsigned long long) (a.cache_base + off);
                 }
             }
             if (pub) {

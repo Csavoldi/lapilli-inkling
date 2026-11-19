@@ -2,6 +2,7 @@
 #include "vision_kernels.cuh"
 
 #include <cstdint>
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::vision {
 
@@ -112,9 +113,7 @@ __global__ void qkv_epilogue_k(const float* g, const float* bias, const float* r
 }
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_f16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1, c[0], c[1], c[2], c[3]);
 }
 
 __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
@@ -220,7 +219,7 @@ __global__ void __launch_bounds__(128) attention_k(const __half* __restrict__ Q,
             for (int dt = 0; dt < 9; ++dt) {
                 uint32_t b0, b1;
                 const uint32_t addr = (uint32_t) __cvta_generic_to_shared(&sV[(kt * 16 + (lane & 15)) * DS + dt * 8]);
-                asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(addr));
+                basalt::volta::ldmatrix_x2<true>(b0, b1, addr);
                 mma16816(o[dt], a, b0, b1);
             }
         }

@@ -39,6 +39,13 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
         // the attention half reads only the BF16 and FP16 images of the mixed rows
         up_mix(m.gemm, (const uint16_t*) wu->data, m.lo16, m.gated, m.R, m.grs, (const float*) wn->data,
                half == 0 ? nullptr : m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+        // a big chunk's peer activations leave now, before the routing (a small chunk's leave from Group::group, behind the
+        // routing's copy)
+        if (half != 0 && T >= early_act_upmix_min() && ppc != nullptr && ppc->share && !stream_all && mmq_plan().any &&
+            mmq_plan().layer[(size_t) l]) {
+            const basalt::kernels::cpu::ExpertLayout& lay_n = basalt::kernels::cpu::expert_layout();
+            ppc->share->send_activations(lay_n.native ? lay_n.fmt[(size_t) l].gu_type : 42, m.mixed, (int) T, m.cs);
+        }
         if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
 
         if (half == 0 && !core::is_qsa_layer(g, l)) {

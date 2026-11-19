@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -55,39 +56,32 @@ __device__ __forceinline__ float ex2(float x) {
 }
 __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
     uint32_t out;
-    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(__float_as_uint(hi)), "r"(__float_as_uint(lo)));
+    // the floats themselves (the original asm passed their bits through "r")
+    (out = basalt::volta::cvt_rn_bf16x2(hi, lo));
     return out;
 }
 __device__ __forceinline__ void ldsm_x2(unsigned& r0, unsigned& r1, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
+    basalt::volta::ldmatrix_x2<false>(r0, r1, a);
 }
 __device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+    basalt::volta::ldmatrix_x4<false>(r0, r1, r2, r3, a);
 }
 __device__ __forceinline__ void ldsm_x4_t(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+    basalt::volta::ldmatrix_x4<true>(r0, r1, r2, r3, a);
 }
 __device__ __forceinline__ void mma_bf16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_bf16(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3]);
 }
 __device__ __forceinline__ void mma_tf32(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    basalt::volta::mma_1688_f32_tf32(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3]);
 }
 __device__ __forceinline__ void cp16(void* dst, const void* src, int bytes) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(bytes));
+    basalt::volta::cp_async_cg16(smem_addr(dst), src, bytes);
 }
 __device__ __forceinline__ void cp8(void* dst, const void* src, int bytes) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(bytes));
+    basalt::volta::cp_async_ca<8>(smem_addr(dst), src, bytes);
 }
 // FP32 or BF16 activations (a dense prompt chunk passes BF16 rows, a caller on the FP32 path FP32)
 __device__ __forceinline__ float ld1(const float* p) { return *p; }
@@ -103,8 +97,8 @@ __device__ __forceinline__ float4 ld4(const __nv_bfloat16* p) {
 }
 __device__ __forceinline__ float2 ld2(const float* p) { return *reinterpret_cast<const float2*>(p); }
 __device__ __forceinline__ float2 ld2(const __nv_bfloat16* p) { return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p)); }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_commit() { basalt::volta::cp_async_commit(); }
+template <int N> __device__ __forceinline__ void cp_wait() { basalt::volta::cp_async_wait<N>(); }
 __device__ __forceinline__ float sum16(float v) {
 #pragma unroll
     for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, 16);
@@ -591,6 +585,135 @@ uint64_t gdn_work_bytes(int64_t T) {
 }
 
 namespace {
+// ---- The token-by-token recurrence in FP32 for V100: the kernel from before the 16-token chunks
+// (tests/models/qwen4exp/prefill/gdn_chunk_parity.cu, "the kernel before"), with q and k normalized in shared memory and
+// plain loads.
+constexpr int SR_VPK = HV / HK;   // value heads per key head
+constexpr int SR_WC = 16, SR_NCB = S / SR_WC, SR_TB = 16;
+template <class In>
+__global__ void __launch_bounds__(SR_WC * 8) gdn_serial_kernel(float* __restrict__ state, const In* __restrict__ h,
+                                                               const float* __restrict__ gate, const float* __restrict__ beta,
+                                                               float eps, float* __restrict__ y, int64_t T) {
+    constexpr int TB = SR_TB, NT = SR_WC * 8, VP = SR_WC / 4;
+    __shared__ __align__(16) float sq[TB][S];
+    __shared__ __align__(16) float sk[TB][S];
+    __shared__ __align__(16) float sv[TB][SR_VPK][SR_WC];
+    __shared__ float sg[TB][SR_VPK], sb[TB][SR_VPK];
+    const int qh = blockIdx.x / SR_NCB, cb = blockIdx.x % SR_NCB;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, rg = lane & 7, c = 4 * warp + (lane >> 3);
+    const int col = cb * SR_WC + c;
+    float s[SR_VPK][16];   // [value head][4 m + e]: row 4 rg + 32 m + e
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int j = 0; j < SR_VPK; ++j)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                s[j][4 * m + e] = state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col];
+    const int64_t nblk = (T + TB - 1) / TB;
+    for (int64_t k = 0; k < nblk; ++k) {
+        const int64_t t0 = k * TB;
+        const int n = (int) ((T - t0) < TB ? (T - t0) : TB);
+        __syncthreads();   // the previous batch of tokens is done
+        for (int p = tid; p < TB * 2 * (S / 4); p += NT) {   // the batch's q and k, 4 values at a time
+            const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
+            const float4 x = i < n ? ld4(h + (t0 + i) * C + (isk ? HK * S : 0) + qh * S + jj) : make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<float4*>(isk ? &sk[i][jj] : &sq[i][jj]) = x;
+        }
+        for (int p = tid; p < TB * SR_VPK * VP; p += NT) {   // v: the 16 columns of each of the 3 value heads
+            const int i = p / (SR_VPK * VP), w = p % (SR_VPK * VP), j = w / VP, jj = (w % VP) * 4;
+            const float4 x = i < n ? ld4(h + (t0 + i) * C + 2 * HK * S + (qh + j * HK) * S + cb * SR_WC + jj)
+                                   : make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<float4*>(&sv[i][j][jj]) = x;
+        }
+        for (int p = tid; p < 2 * TB * SR_VPK; p += NT) {
+            const int isb = p / (TB * SR_VPK), w = p % (TB * SR_VPK), i = w / SR_VPK, j = w % SR_VPK;
+            const float x = i < n ? (isb ? beta : gate)[(t0 + i) * HV + qh + j * HK] : 0.0f;
+            if (isb) sb[i][j] = x;
+            else sg[i][j] = x;
+        }
+        __syncthreads();
+        // each token's q and k normalized (as gdn_prepare: rsqrt(sum of squares + eps)): warp w takes rows
+        // 8 w .. 8 w + 7 (row r: token r / 2, q if r is even, k otherwise), 4 values per thread
+        for (int r = 8 * warp; r < 8 * warp + 8; ++r) {
+            float* x = (r & 1) ? sk[r >> 1] : sq[r >> 1];
+            float4 v = reinterpret_cast<const float4*>(x)[lane];
+            float ss = 0.0f;
+            ss = fmaf(v.x, v.x, ss);
+            ss = fmaf(v.y, v.y, ss);
+            ss = fmaf(v.z, v.z, ss);
+            ss = fmaf(v.w, v.w, ss);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+            const float inv = rsqrtf(ss + eps);
+            v.x *= inv; v.y *= inv; v.z *= inv; v.w *= inv;
+            reinterpret_cast<float4*>(x)[lane] = v;
+        }
+        __syncthreads();
+#pragma unroll 2
+        for (int i = 0; i < n; ++i) {
+            const int64_t t = t0 + i;
+            const float4* k4 = reinterpret_cast<const float4*>(&sk[i][4 * rg]);
+            const float4* q4 = reinterpret_cast<const float4*>(&sq[i][4 * rg]);
+            float kc[16], qc[16];
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const float4 a = k4[8 * m], b = q4[8 * m];
+                kc[4 * m] = a.x; kc[4 * m + 1] = a.y; kc[4 * m + 2] = a.z; kc[4 * m + 3] = a.w;
+                qc[4 * m] = b.x; qc[4 * m + 1] = b.y; qc[4 * m + 2] = b.z; qc[4 * m + 3] = b.w;
+            }
+            float g[SR_VPK], kv[SR_VPK], delta[SR_VPK], o[SR_VPK];
+#pragma unroll
+            for (int j = 0; j < SR_VPK; ++j) { g[j] = __expf(sg[i][j]); kv[j] = 0.0f; o[j] = 0.0f; }
+#pragma unroll
+            for (int r = 0; r < 16; ++r)
+#pragma unroll
+                for (int j = 0; j < SR_VPK; ++j) kv[j] = fmaf(s[j][r], kc[r], kv[j]);
+#pragma unroll
+            for (int x = 1; x < 8; x <<= 1)
+#pragma unroll
+                for (int j = 0; j < SR_VPK; ++j) kv[j] += __shfl_xor_sync(0xffffffffu, kv[j], x);
+#pragma unroll
+            for (int j = 0; j < SR_VPK; ++j) delta[j] = (sv[i][j][c] - g[j] * kv[j]) * sb[i][j];
+#pragma unroll
+            for (int r = 0; r < 16; ++r)
+#pragma unroll
+                for (int j = 0; j < SR_VPK; ++j) {
+                    s[j][r] = fmaf(g[j], s[j][r], kc[r] * delta[j]);
+                    o[j] = fmaf(s[j][r], qc[r], o[j]);
+                }
+#pragma unroll
+            for (int x = 1; x < 8; x <<= 1)
+#pragma unroll
+                for (int j = 0; j < SR_VPK; ++j) o[j] += __shfl_xor_sync(0xffffffffu, o[j], x);
+            if (rg < SR_VPK)   // row group j writes value head j's output
+                y[t * HV * S + (qh + rg * HK) * S + col] = (rg == 0 ? o[0] : rg == 1 ? o[1] : o[2]) * rsqrtf((float) S);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < SR_VPK; ++j)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col] = s[j][4 * m + e];
+}
+// BASALT_GDN_SERIAL=1 / =0 forces it on / off; unset, on below compute capability 8 (V100: no bf16 / tf32 tensor cores)
+bool gdn_serial_on() {
+    static int forced = -2;
+    if (forced == -2) {
+        const char* e = std::getenv("BASALT_GDN_SERIAL");
+        forced = (e && *e) ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+    }
+    if (forced >= 0) return forced == 1;
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return major < 8;
+}
 template <class In>
 void recurrence_impl(float* state, const In* h, const float* gate, const float* beta, const In* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
@@ -598,6 +721,9 @@ void recurrence_impl(float* state, const In* h, const float* gate, const float* 
                     float* rowmax = nullptr) {
     if (T > 0) {
         const cudaStream_t s = (cudaStream_t) stream;
+        if (gdn_serial_on()) {   // on V100, the token-by-token recurrence
+            gdn_serial_kernel<In><<<HK * SR_NCB, SR_WC * 8, 0, s>>>(state, h, gate, beta, eps, y, T);
+        } else {
         const int chunks = (int) ((T + CK - 1) / CK);
         QkChunk* qk = static_cast<QkChunk*>(work);
         Control* ctl = reinterpret_cast<Control*>(qk + (int64_t) HK * chunks);
@@ -616,6 +742,7 @@ void recurrence_impl(float* state, const In* h, const float* gate, const float* 
             attr[dev].store(true, std::memory_order_release);
         }
         gdn_chunk_kernel<In><<<HV * (S / DV), NTH, sizeof(ChunkShared<In>), s>>>(state, h, qk, ctl, y, (int) T);
+        }   // end of the chunked path
         if constexpr (sizeof(In) == 4)
             if (y16 || yn) gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
         if (y8)
