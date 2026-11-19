@@ -342,8 +342,9 @@ def make_handler(target: Service | Router):
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
-            elif path == "":
-                body = (ROOT / "serve" / "web" / "index.html").read_bytes()
+            elif path in ("", "/dashboard"):
+                # "/" serves the Lapilli chat page; Basalt's dashboard stays at /dashboard
+                body = (ROOT / "serve" / "web" / ("index.html" if path == "/dashboard" else "lapilli.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

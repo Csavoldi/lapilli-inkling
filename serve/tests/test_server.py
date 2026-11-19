@@ -2388,8 +2388,15 @@ class WebApp(unittest.TestCase):
         code, ctype, body = self.get("/")
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
-        self.assertIn(b"\"web/app.js\"", body)   # relative (works behind a path-prefixed proxy)
+        # "/" serves the Lapilli chat page; Basalt's dashboard is at /dashboard
+        self.assertIn(b"\"web/lapilli.js\"", body)   # relative (works behind a path-prefixed proxy)
+        code, ctype, body = self.get("/dashboard")
+        self.assertEqual(code, 200)
+        self.assertIn("text/html", ctype)
+        self.assertIn(b"\"web/app.js\"", body)
         for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/mark.svg", "image/svg+xml"),
+                           ("/web/lapilli.js", "javascript"), ("/web/lapilli.css", "text/css"),
+                           ("/web/marked.umd.js", "javascript"), ("/web/lapilli-icons.svg", "image/svg+xml"),
                            ("/fonts/geist-latin-wght.woff2", "font/woff2"),
                            ("/fonts/geist-mono-latin-wght.woff2", "font/woff2")):
             with self.subTest(path=path):
