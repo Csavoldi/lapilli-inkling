@@ -9,6 +9,10 @@ monitor of the GPUs. Basalt's own dashboard moves to `/dashboard`. The server ke
 
 *Lapilli are the small fragments a volcano throws out: small pieces of basalt.*
 
+<p align="center"><img src="docs/img/lapilli-chat.png" alt="The Lapilli chat page: a question, the collapsed reasoning and the formatted answer" width="820"></p>
+<p align="center"><img src="docs/img/lapilli-monitor.png" alt="The live monitor while an answer is written: speed, the two V100s, CPU, RAM and disk" width="600">&nbsp;&nbsp;<img src="docs/img/lapilli-phone.png" alt="The chat page on a phone" width="178"></p>
+<p align="center"><sub>The chat page, the live monitor while an answer is being written, and the same page on a phone. Screenshots of this build on two V100s.</sub></p>
+
 > Based on Basalt commit `6809edfa` (November 15, 2026). Basalt moves fast; this fork is a snapshot of it and does not follow
 > upstream. Provided as is, without support (see [Support](#support)).
 

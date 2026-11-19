@@ -10,6 +10,10 @@ garde les API OpenAI et Anthropic de Basalt.
 
 *Les lapilli sont les petits fragments que projette un volcan : de petits morceaux de basalte.*
 
+<p align="center"><img src="docs/img/lapilli-chat.png" alt="La page de discussion de Lapilli : une question, la réflexion repliée et la réponse mise en forme" width="820"></p>
+<p align="center"><img src="docs/img/lapilli-monitor.png" alt="Le moniteur en direct pendant l'écriture d'une réponse : vitesse, les deux V100, processeur, RAM et disque" width="600">&nbsp;&nbsp;<img src="docs/img/lapilli-phone.png" alt="La page de discussion sur un téléphone" width="178"></p>
+<p align="center"><sub>La page de discussion, le moniteur en direct pendant l'écriture d'une réponse, et la même page sur un téléphone. Captures de cette version sur deux V100.</sub></p>
+
 > Fondé sur le commit `6809edfa` de Basalt (15 novembre 2026). Basalt évolue vite ; ce fork en est une photo figée et ne suit
 > pas ses mises à jour. Fourni tel quel, sans support (voir [Support](#support)).
 
