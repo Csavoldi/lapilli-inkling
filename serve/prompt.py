@@ -28,6 +28,11 @@ def overflow_error(n: int, max_new: int, ctx: int) -> ValueError:
                       "the --config file) to shorten it to the room left")
 
 
+class PromptIds(list):
+    """A prompt as tokens that keeps the text it tokenizes (the exact resume of a follow-up: Service._exact_resume)."""
+    text = ""
+
+
 class PromptText:
     def __init__(self, tokenizer, text: str, plain=(), tail: str = "", clip: bool = False):
         self.tok = tokenizer

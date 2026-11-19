@@ -5,6 +5,7 @@ import collections
 import contextlib
 import ctypes
 import inspect
+import os
 import subprocess
 import threading
 import time
@@ -17,7 +18,7 @@ from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_t
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
-from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
+from serve.prompt import CTX_SLACK, PromptIds, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
@@ -113,6 +114,9 @@ class Service:
         self.images_waiting = 0                         # bytes of read images waiting for their turn to encode
         # put a non-default reasoning effort in a system turn before the answer so the cached prefix survives
         self.effort_end = False
+        # the last turn (its prompt text, its prompt tokens when known, their count, the generated tokens), so that the next
+        # turn of the conversation resumes the engine's cache for sure (_exact_resume)
+        self.last_turn = None
         self.logs = LogBuffer()                         # server and engine output
         # origins allowed to call /v1/* (CORS; "*" = any); empty: no CORS headers
         self.cors_origins: list[str] = []
@@ -869,6 +873,9 @@ class Service:
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
         tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        resumed = self._exact_resume(text, plain, tail)        # a follow-up reuses the whole engine cache
+        if resumed is not None:
+            return self._fit(resumed, kwargs, max_new)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
@@ -882,6 +889,57 @@ class Service:
         prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens)
         prompt.max_new = max_new
         return prompt, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def _exact_resume(self, text, plain, tail):
+        """When the rendered prompt starts with the last turn's prompt THEN the exact text of its generated tokens, send the
+        prompt as tokens: the previous prompt's tokens, the generated tokens as they are (except the last one, which the
+        engine has not read), then the tokenization of the rest. The engine then recognizes its whole cache, even when the
+        model sampled a tokenization that retokenizing the text would not reproduce. Same text to the character, else None
+        (the text goes as text, as before). BASALT_EXACT_RESUME=0 turns it off."""
+        t = self.last_turn
+        if t is None or plain or tail or os.environ.get("BASALT_EXACT_RESUME", "1") == "0":
+            return None
+        if not text.startswith(t["text"]):
+            return None
+        gen = t["gen"][:-1]
+        if not gen:
+            return None
+        try:
+            written = b"".join(self.tok.token_bytes(x) for x in gen).decode("utf-8")
+        except (AttributeError, IndexError, UnicodeDecodeError):
+            return None                                 # a character split across two tokens, or no token bytes known
+        rest = text[len(t["text"]):]
+        if not written or not rest.startswith(written):
+            return None
+        before = t["ids"]
+        if before is None:
+            before = self.tok.encode(t["text"], parse_special=True)
+            if t["n"] is not None and len(before) != t["n"]:    # Python and the engine did not tokenize the prompt alike
+                return None
+        ids = PromptIds(before + gen + self.tok.encode(rest[len(written):], parse_special=True))
+        ids.text = text
+        if os.environ.get("BASALT_RESUME_TRACE") == "1":     # what retokenizing the text would have given
+            retokenized = self.tok.encode(text, parse_special=True)
+            k = next((i for i, (a, b) in enumerate(zip(retokenized, ids)) if a != b), None)
+            if k is None and len(retokenized) != len(ids):
+                k = min(len(retokenized), len(ids))
+            print(f"[server] exact resume: {len(before) + len(gen)} tokens reused as they are; retokenizing the text "
+                  + ("would have given the same tokens" if k is None else f"would have differed at token {k} of {len(ids)}"),
+                  flush=True)
+        return ids
+
+    def _keep_turn(self, ids, raw_ids) -> None:
+        """Keep the turn that ends, for the exact resume of the next one: its prompt text (rendered, without a literal or a
+        forced opening), its prompt tokens when known, their count and all the generated tokens (the engine keeps the prompt
+        and all those tokens but the last one)."""
+        text = getattr(ids, "text", None)
+        if not text or not raw_ids or getattr(ids, "plain", None) or getattr(ids, "tail", ""):
+            self.last_turn = None
+            return
+        if isinstance(ids, PromptText):
+            self.last_turn = {"text": text, "ids": None, "n": ids.n, "gen": list(raw_ids)}
+        else:
+            self.last_turn = {"text": text, "ids": list(ids), "n": len(ids), "gen": list(raw_ids)}
 
     def _check_images(self, messages, images) -> None:
         """Refuse, before rendering, a request whose images cannot reach the prompt."""
@@ -1453,6 +1511,7 @@ class Service:
                                 "ttft_s": round(ttft, 2) if ttft is not None else None,
                                 "draft_len": round(dl, 2) if dl is not None else None})
                             self._note_best(self.history[-1])
+                            self._keep_turn(ids, raw_ids)       # for the exact resume of the next turn
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # a DONE line arrived for this request
                                 timings = request_timings(seen, n, last)
