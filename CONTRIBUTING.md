@@ -1,5 +1,8 @@
 # Contributing to Basalt
 
+> **This repository is Lapilli, a fork of Basalt for NVIDIA V100 (sm_70).** The guide below is Basalt's own and applies to
+> Basalt; upstream does not take other architectures. This fork is shared as is (see the README's Support section).
+
 Basalt is a local inference engine for NVIDIA Blackwell GPUs. Every rule below exists to keep its models fast and correct on that one target.
 
 ## Scope

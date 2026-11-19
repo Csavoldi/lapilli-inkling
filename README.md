@@ -1,96 +1,118 @@
-<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
+# Lapilli: Basalt on NVIDIA V100
 
-Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash** and **Qwen3.8-27B**. It runs
-on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with what does not fit in VRAM (the experts of a mixture-of-experts model)
-in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
+Lapilli is a port of [Basalt](https://github.com/jesdga95/basalt), the local inference engine for **Qwen3.8-Flash-Next**,
+to **NVIDIA V100** GPUs (Volta, compute capability 7.0). Upstream Basalt targets Blackwell (sm_120) only and does not take
+other architectures; this fork adds sm_70 and keeps the Blackwell build as it was.
 
-<p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
+It also brings a chat page, served at `/`: conversations, reasoning levels, image input, tool calls shown as cards, and a live
+monitor of the GPUs. Basalt's own dashboard moves to `/dashboard`. The server keeps Basalt's OpenAI and Anthropic APIs.
 
-**Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
+*Lapilli are the small fragments a volcano throws out: small pieces of basalt.*
+
+> Based on Basalt commit `6809edfa` (November 15, 2026). Basalt moves fast; this fork is a snapshot of it and does not follow
+> upstream. Provided as is, without support (see [Support](#support)).
+
+## What was measured
+
+One machine: 2 x V100-SXM2 32 GB (on PCIe 3.0 x16 and x4 links, peer-to-peer off: see below), Intel Core i9-14900K, 96 GB of
+RAM, Windows 10, CUDA 12.6, NVIDIA driver 561.17, the `Qwen3.8-FN-UD-Q4_K_XL` pack (115 GB) on an NVMe SSD, experts
+memory-mapped. Measured on November 20, 2026, with the build from this repository; each speed is the median of three runs.
+Strata v0.2.13, the V100-capable engine Basalt descends from, ran the same measurements on the same machine earlier.
+
+| | Lapilli | Strata v0.2.13, same machine |
+|---|---|---|
+| Decode, short answer (256 tokens, temperature 0) | 91 tokens/s | 58 to 72 tokens/s |
+| Decode, long answer with reasoning (1,500 tokens) | 140 tokens/s (133 to 145) | 68 to 94 tokens/s |
+| Prompt processing, 3,000 tokens | 1,295 tokens/s | |
+| Prompt processing, 4,200 tokens | 1,170 tokens/s | 250 to 490 tokens/s |
+| Prompt processing, 8,000 / 16,000 tokens | 1,504 / 1,448 tokens/s | |
+| Time to load the model | 34 s | |
+
+Quality, with Basalt's own gate (`basalt-bench --quality 100`, 100 chunks through the decode path, against the BF16 reference):
+
+| | Lapilli on 2 x V100 | Basalt's published figures for this pack (RTX 5090) |
+|---|---|---|
+| Perplexity | 3.3206 | 3.321 |
+| Mean KLD | 0.04932 | 0.0496 |
+| Same top-1 token | 92.75% | 92.63% |
+
+The port keeps the pack's quality. 108 of Basalt's 122 GPU parity tests pass on a V100; the others test paths a V100 does not
+take with this pack: Blackwell-only kernels (FP8, FP4, TMA), thread-block clusters (the engine uses its cluster-free fallback),
+more than 96 KB of shared memory per block, and two bitwise comparisons between paths that add in a different order on Volta.
 
 ## Requirements
 
-- Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
-- An NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
-- CMake 3.24+, GCC 13+ (Linux), Python 3.10+, and enough system RAM for the experts that do not fit in VRAM.
+- One or more NVIDIA V100 GPUs. Tested: two V100-SXM2 32 GB.
+- Windows 10 or 11 x64. Linux is not tested (see [Not tested](#not-tested)).
+- CUDA Toolkit 12.6 to 12.9 (CUDA 13 dropped Volta), the Visual Studio 2022 Build Tools (C++), CMake 3.24+, Python 3.10+.
+- System RAM and a fast SSD for the experts that do not fit in VRAM: the pack is 115 GB. Tested with 96 GB of RAM.
+- A K-quant pack. NVFP4 packs need FP4 hardware and do not run on a V100. Tested: `Qwen3.8-FN-UD-Q4_K_XL`.
 
-## Quick start
+## Build (Windows)
 
-Prebuilt Linux and Windows archives are attached to each [release](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)); otherwise build from source:
+From an *x64 Native Tools Command Prompt for VS 2022*:
 
-```sh
-git clone https://github.com/jesdga95/basalt && cd basalt
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
-                                        # Windows: add -G Ninja to the first line, from an x64 VS 2022 prompt ([platforms](docs/platforms.md#building-on-windows))
-                                        # one model only: -DBASALT_MODELS=qwen4exp, deepseek41 or qwen35 ([building](docs/building.md#building-only-some-models))
-pip install -r requirements.txt
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4-DQ6_K.basalt --local-dir models
+```bat
+git clone https://github.com/<this fork> lapilli && cd lapilli
+cmake -S . -B build70 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 -DBASALT_MODELS=qwen4exp -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+cmake --build build70
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
-Put the settings in `basalt_config.json`:
+The executables land in `bin\`. A full build, tests included, took 49 minutes on a 24-core i9-14900K with 6 parallel jobs. `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared` avoids a duplicate `cudart` at link time on
+Windows. `-DBUILD_TESTING=ON` adds the parity tests (`ctest --test-dir build70 -L gpu`).
 
-```json
-{
-  "version": 2,
-  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
-  "engine": { "resident-experts": true },
-  "server": { "port": 8080 }
-}
+## Run
+
+```bat
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-UD-Q4_K_XL.basalt --local-dir models
+bin\basalt.exe serve models\Qwen3.8-FN-UD-Q4_K_XL.basalt --gpu 0,1 --kv int8 --mmap-experts --resident-experts --peer-exclusive --vram-reserve-mib 700 --ram-reserve-mib 16384 --max-context 262144 --vision dynamic --port 8080
 ```
 
-```sh
-bin/basalt serve --config basalt_config.json
-```
+Then open `http://127.0.0.1:8080/`. Every flag works as in Basalt: see its [running](docs/running.md) and
+[configuration](docs/configuration/index.md) pages (this repository's `docs/` is Basalt's documentation, written for Blackwell).
 
-The server listens on 127.0.0.1. Every setting: [configuration](docs/configuration/index.md). More examples:
-[example configurations](docs/configuration/examples.md).
+## What changed from Basalt
 
-## Models
+- **Build**: compute capability 7.0 is accepted next to 12.0, with CUDA 12.6 or newer.
+- **A compatibility layer** (`include/basalt/kernels/volta_compat.cuh`): every newer PTX instruction the engine uses (`cp.async`,
+  `ldmatrix`, the `mma` shapes of Turing and Ampere, tf32 and bf16 conversions, `griddepcontrol`, clusters) gets a correct sm_70
+  equivalent, so every kernel compiles and runs right on a V100.
+- **V100 paths for the hot kernels**: llama.cpp's dp4a path for the quantized prompt products; int8 prompt attention on the
+  V100 tensor cores (`mma.m8n8k4`, from Strata); hyper-connection reads, the router, the decode experts and the GDN recurrence
+  rewritten for Volta; the expert exchange between two cards tuned for V100.
+- **Peer-to-peer access is off by default on Volta**: on the test machine, direct copies between the two V100s returned wrong
+  data. The copies go through the host instead. `BASALT_PEER_NO_P2P=0` turns peer access back on, at your own risk.
+- **Server**: the exact resume of a follow-up turn (the previous answer's tokens are reused as they were sampled, so the
+  engine always finds its cache).
+- **The Lapilli chat page** at `/`; Basalt's dashboard at `/dashboard`.
 
-| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B |
-|---|---|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) |
-| Context | up to 262,144 (longer with YaRN) | up to 1,048,576 | up to 262,144 |
-| Drafting | MTP, on by default | DSpark, on by default | DFlash 2, on by default |
-| Images | yes | yes | yes |
-| Documents (PDF, text) | yes | yes | yes |
-| Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) |
-| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) |
+The `BASALT_*` environment variables added by the port are the A/B switches used while measuring it; their defaults are the
+best measured on V100, and they are not meant as settings.
 
-All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md).
+## Not tested
 
-## Video
+A single V100; V100 16 GB or PCIe cards; NVLink with peer access on; Linux (the code is platform-neutral like Basalt's, but the
+port was only built and run on Windows); packs other than `UD-Q4_K_XL`; Basalt's other models (DeepSeek-V4.1-Flash and
+Qwen3.8-27B are not built: `-DBASALT_MODELS=qwen4exp`); Blackwell builds of this fork.
 
-Qwen3.8-Flash-Next and Qwen3.8-27B read video; DeepSeek does not. A video is named like an image in a chat message, and needs
-`--vision` and FFmpeg on the machine. Flash-Next decodes frames on the GPU with NVDEC; the 27B decodes them on the CPU.
-How a request names a video, and the limits: [video](docs/running.md#video).
+## Support
 
-## Documentation
+This fork is shared as is, in the hope that it helps other V100 owners. There is no promise of support or updates. Issues
+may be read, but may not get an answer.
 
-- **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
-  [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
-  [documents](docs/configuration/documents.md),
-  [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
-- **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md), [DeepSeek](docs/models/deepseek41.md),
-  [Qwen3.8-27B](docs/models/qwen38-27b.md),
-  [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).
-- **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality.md).
-- **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md), [community runs](docs/community.md),
-  [changelog](docs/changelog/index.md), [contributing](CONTRIBUTING.md).
+## Credits and license
 
-## Credits
+MIT, like Basalt ([LICENSE](LICENSE)). Lapilli stands on the work of others:
 
-- **Code:** [Strata](https://github.com/Niko1221/Strata), the project Basalt forks (MIT); [Infernix](https://github.com/Wallawalla47/Infernix)
-  (Ian Ranson and contributors, Apache-2.0), whose kernels are adapted; [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp)
-  (MIT); and ideas from [NInfer](https://github.com/Neroued/ninfer). Licences: [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
-- **Models:** [Qwen](https://huggingface.co/Qwen) and [DeepSeek](https://huggingface.co/deepseek-ai), under the licences on their cards;
-  [Unsloth](https://huggingface.co/unsloth)'s GGUFs; [NVIDIA](https://huggingface.co/nvidia)'s NVFP4 checkpoints;
-  [QUASAR-QAT](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)'s NVFP4 27B (Apache-2.0); [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)'s DFlash 2 drafter.
+- [Basalt](https://github.com/jesdga95/basalt) by Jesús Gulfo (MIT): the engine.
+- [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors (MIT): Basalt's origin, and the V100
+  prompt-attention kernel used here.
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the dp4a prompt products.
+- [marked](https://github.com/markedjs/marked) (MIT): the chat page's text formatting. Geist font (SIL Open Font License).
 
-Thank you to everyone who has [contributed](https://github.com/jesdga95/basalt/graphs/contributors) or
-[sponsored](https://github.com/sponsors/jesdga95) the project.
+Every notice is in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES). Basalt's own README, with its models and documentation, is at
+[github.com/jesdga95/basalt](https://github.com/jesdga95/basalt).
 
-## License
-
-MIT, see [LICENSE](LICENSE).
+French: [README.fr.md](README.fr.md).
