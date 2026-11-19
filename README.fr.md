@@ -50,6 +50,21 @@ n'additionnent pas dans le même ordre sur Volta.
 - De la RAM et un SSD rapide pour les experts qui ne tiennent pas en VRAM : le pack fait 115 Go. Essayé avec 96 Go de RAM.
 - Un pack en K-quant. Les packs NVFP4 exigent du FP4 matériel et ne tournent pas sur V100. Essayé : `Qwen3.8-FN-UD-Q4_K_XL`.
 
+## Archive prête à l'emploi (Windows)
+
+Chaque version publiée porte `lapilli-v100-<tag>-windows-x64.zip` : `bin\` (`basalt`, `basalt-bench`, `basalt-probe`,
+`basalt-vision`), le serveur, la page de discussion, `data\`, `docs\`, `requirements.txt` et les licences. Comme celles de
+Basalt, elle ne contient aucune bibliothèque CUDA ni environnement Python. Il faut :
+
+- Un pilote NVIDIA qui gère CUDA 12.6 (essayé : 561.17).
+- Les bibliothèques d'exécution de CUDA 12 dans le `PATH` : `cudart64_12.dll`, `cublas64_12.dll` et `cublasLt64_12.dll`.
+  Le CUDA Toolkit 12.6 à 12.9 les installe.
+- Le Microsoft Visual C++ 2015-2022 Redistributable (x64).
+- Python 3.10+ avec les dépendances dans un `.venv` en tête de l'archive, que `bin\basalt.exe serve` utilise quand il est là :
+  `py -3 -m venv .venv` puis `.venv\Scripts\pip install -r requirements.txt`.
+
+Ensuite, voir [Lancer](#lancer).
+
 ## Compiler (Windows)
 
 Depuis une *x64 Native Tools Command Prompt for VS 2022* :

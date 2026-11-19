@@ -48,6 +48,21 @@ more than 96 KB of shared memory per block, and two bitwise comparisons between 
 - System RAM and a fast SSD for the experts that do not fit in VRAM: the pack is 115 GB. Tested with 96 GB of RAM.
 - A K-quant pack. NVFP4 packs need FP4 hardware and do not run on a V100. Tested: `Qwen3.8-FN-UD-Q4_K_XL`.
 
+## Prebuilt archive (Windows)
+
+Each release carries `lapilli-v100-<tag>-windows-x64.zip`: `bin\` (`basalt`, `basalt-bench`, `basalt-probe`,
+`basalt-vision`), the server, the chat page, `data\`, `docs\`, `requirements.txt` and the licences. Like Basalt's archives, it
+holds no CUDA libraries and no Python environment. It needs:
+
+- An NVIDIA driver that supports CUDA 12.6 (tested: 561.17).
+- The CUDA 12 runtime libraries on the `PATH`: `cudart64_12.dll`, `cublas64_12.dll` and `cublasLt64_12.dll`. The CUDA Toolkit 12.6
+  to 12.9 installs them.
+- The Microsoft Visual C++ 2015-2022 Redistributable (x64).
+- Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin\basalt.exe serve` uses when it is
+  there: `py -3 -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`.
+
+Then follow [Run](#run).
+
 ## Build (Windows)
 
 From an *x64 Native Tools Command Prompt for VS 2022*:
