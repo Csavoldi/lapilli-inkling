@@ -44,10 +44,27 @@ The port keeps the pack's quality. 108 of Basalt's 122 GPU parity tests pass on 
 take with this pack: Blackwell-only kernels (FP8, FP4, TMA), thread-block clusters (the engine uses its cluster-free fallback),
 more than 96 KB of shared memory per block, and two bitwise comparisons between paths that add in a different order on Volta.
 
+## Tested by users
+
+**One V100 PCIe 32 GB on Linux**, reported by u/nebod99 (i9-10940X, 96 GB of RAM, CUDA 12.6.3 in Docker, the `IQ3_S` pack,
+thinking on, a 7,242-token prompt and 1,024 generated tokens per run), against Strata on the same machine:
+
+| | Strata, 128K context | Lapilli, 128K context |
+|---|---|---|
+| Decode, long prompt | 55.6 tokens/s | **100.9 tokens/s** |
+| First token, long prompt | 22.6 s | **8.7 s** |
+| Launch to ready | 70 s | 90 s |
+
+The first run outside the machine it was developed on, and the first on Linux, on a single card and on PCIe. Full report,
+with the 16K runs and the Linux build: [docs/community/one-v100-pcie-linux.md](docs/community/one-v100-pcie-linux.md).
+
+A big thank you to nebod99 for the time and care put into this test, and for sharing it so that every V100 owner can
+benefit from it.
+
 ## Requirements
 
-- One or more NVIDIA V100 GPUs. Tested: two V100-SXM2 32 GB.
-- Windows 10 or 11 x64. Linux is not tested (see [Not tested](#not-tested)).
+- One or more NVIDIA V100 GPUs. Tested: two V100-SXM2 32 GB; one V100 PCIe 32 GB by a user (see [Tested by users](#tested-by-users)).
+- Windows 10 or 11 x64, or Linux (run by a user with CUDA 12.6.3 in Docker; the build steps below are for Windows).
 - CUDA Toolkit 12.6 to 12.9 (CUDA 13 dropped Volta), the Visual Studio 2022 Build Tools (C++), CMake 3.24+, Python 3.10+.
 - System RAM and a fast SSD for the experts that do not fit in VRAM: the pack is 115 GB. Tested with 96 GB of RAM.
 - A K-quant pack. NVFP4 packs need FP4 hardware and do not run on a V100. Tested: `Qwen3.8-FN-UD-Q4_K_XL`.
@@ -112,8 +129,7 @@ best measured on V100, and they are not meant as settings.
 
 ## Not tested
 
-A single V100; V100 16 GB or PCIe cards; NVLink with peer access on; Linux (the code is platform-neutral like Basalt's, but the
-port was only built and run on Windows); packs other than `UD-Q4_K_XL`; Basalt's other models (DeepSeek-V4.1-Flash and
+V100 16 GB cards; NVLink with peer access on; packs other than `UD-Q4_K_XL` and `IQ3_S`; Basalt's other models (DeepSeek-V4.1-Flash and
 Qwen3.8-27B are not built: `-DBASALT_MODELS=qwen4exp`); Blackwell builds of this fork.
 
 ## Support

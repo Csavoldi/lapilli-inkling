@@ -46,10 +46,28 @@ chemins qu'une V100 ne prend pas avec ce pack : des noyaux propres à Blackwell 
 prend son chemin de repli), plus de 96 Ko de mémoire partagée par bloc, et deux comparaisons au bit près entre des chemins qui
 n'additionnent pas dans le même ordre sur Volta.
 
+## Essayé par des utilisateurs
+
+**Une V100 PCIe 32 Go sous Linux**, essai de u/nebod99 (i9-10940X, 96 Go de RAM, CUDA 12.6.3 dans Docker, le pack `IQ3_S`,
+réflexion allumée, un message de 7 242 jetons et 1 024 jetons écrits par passage), contre Strata sur la même machine :
+
+| | Strata, contexte 128K | Lapilli, contexte 128K |
+|---|---|---|
+| Écriture, long message | 55,6 jetons/s | **100,9 jetons/s** |
+| Premier jeton, long message | 22,6 s | **8,7 s** |
+| Du lancement à prêt | 70 s | 90 s |
+
+Le premier essai hors de la machine où le portage a été fait, et le premier sous Linux, sur une seule carte et en PCIe.
+Le rapport complet, avec les passages en 16K et la compilation sous Linux (en anglais) :
+[docs/community/one-v100-pcie-linux.md](docs/community/one-v100-pcie-linux.md).
+
+Un grand merci à nebod99 pour le temps et le soin mis dans cet essai, et pour l'avoir partagé : tous les possesseurs de V100
+en profitent.
+
 ## Prérequis
 
-- Une ou plusieurs NVIDIA V100. Essayé : deux V100-SXM2 32 Go.
-- Windows 10 ou 11 x64. Linux n'est pas essayé (voir [Pas essayé](#pas-essayé)).
+- Une ou plusieurs NVIDIA V100. Essayé : deux V100-SXM2 32 Go ; une V100 PCIe 32 Go par un utilisateur (voir [Essayé par des utilisateurs](#essayé-par-des-utilisateurs)).
+- Windows 10 ou 11 x64, ou Linux (lancé par un utilisateur avec CUDA 12.6.3 dans Docker ; la compilation ci-dessous est celle de Windows).
 - CUDA Toolkit 12.6 à 12.9 (CUDA 13 a abandonné Volta), les Build Tools de Visual Studio 2022 (C++), CMake 3.24+, Python 3.10+.
 - De la RAM et un SSD rapide pour les experts qui ne tiennent pas en VRAM : le pack fait 115 Go. Essayé avec 96 Go de RAM.
 - Un pack en K-quant. Les packs NVFP4 exigent du FP4 matériel et ne tournent pas sur V100. Essayé : `Qwen3.8-FN-UD-Q4_K_XL`.
@@ -114,8 +132,7 @@ défaut sont les meilleures mesurées sur V100, ce ne sont pas des réglages.
 
 ## Pas essayé
 
-Une seule V100 ; les V100 16 Go ou PCIe ; NVLink avec le pair à pair allumé ; Linux (le code est portable comme celui de Basalt,
-mais le portage n'a été compilé et lancé que sous Windows) ; d'autres packs que `UD-Q4_K_XL` ; les autres modèles de Basalt
+Les V100 16 Go ; NVLink avec le pair à pair allumé ; d'autres packs que `UD-Q4_K_XL` et `IQ3_S` ; les autres modèles de Basalt
 (DeepSeek-V4.1-Flash et Qwen3.8-27B ne sont pas compilés : `-DBASALT_MODELS=qwen4exp`) ; la compilation Blackwell de ce fork.
 
 ## Support
