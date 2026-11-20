@@ -58,11 +58,16 @@ réflexion allumée, un message de 7 242 jetons et 1 024 jetons écrits par pass
 | Du lancement à prêt | 70 s | 90 s |
 
 Le premier essai hors de la machine où le portage a été fait, et le premier sous Linux, sur une seule carte et en PCIe.
-Le rapport complet, avec les passages en 16K et la compilation sous Linux (en anglais) :
+
+Justesse, sur la même machine : sur plus de 2 500 questions tirées de tests publics (réflexion allumée, température 0),
+Lapilli obtient les mêmes scores que Strata avec le même modèle, à égalité avec les meilleurs résultats que nebod99 ait
+jamais eus, tous modèles et moteurs confondus.
+
+Le rapport complet, avec les passages en 16K, les résultats de justesse et la compilation sous Linux (en anglais) :
 [docs/community/one-v100-pcie-linux.md](docs/community/one-v100-pcie-linux.md).
 
-Un grand merci à nebod99 pour le temps et le soin mis dans cet essai, et pour l'avoir partagé : tous les possesseurs de V100
-en profitent.
+Un grand merci à nebod99 pour le temps et le soin mis dans ces essais, et pour les avoir partagés : tous les possesseurs
+de V100 en profitent.
 
 ## Prérequis
 

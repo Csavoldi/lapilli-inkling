@@ -55,11 +55,17 @@ thinking on, a 7,242-token prompt and 1,024 generated tokens per run), against S
 | First token, long prompt | 22.6 s | **8.7 s** |
 | Launch to ready | 70 s | 90 s |
 
-The first run outside the machine it was developed on, and the first on Linux, on a single card and on PCIe. Full report,
-with the 16K runs and the Linux build: [docs/community/one-v100-pcie-linux.md](docs/community/one-v100-pcie-linux.md).
+The first run outside the machine it was developed on, and the first on Linux, on a single card and on PCIe.
 
-A big thank you to nebod99 for the time and care put into this test, and for sharing it so that every V100 owner can
-benefit from it.
+Quality, on the same machine: on more than 2,500 questions selected from public benchmarks (thinking on, temperature 0),
+Lapilli scores the same as Strata with the same model, tied with the best results nebod99 has ever had from any model or
+engine.
+
+Full report, with the 16K runs, the quality results and the Linux build:
+[docs/community/one-v100-pcie-linux.md](docs/community/one-v100-pcie-linux.md).
+
+A big thank you to nebod99 for the time and care put into these tests, and for sharing them so that every V100 owner can
+benefit from them.
 
 ## Requirements
 
