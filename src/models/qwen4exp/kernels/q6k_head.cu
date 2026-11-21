@@ -4,12 +4,7 @@
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-#define BASALT_REDUCE_ADD(m, v) basalt::volta::reduce_add_sync((m), (v))
-#else
-#define BASALT_REDUCE_ADD(m, v) __reduce_add_sync((m), (v))
-#endif
-#include "head_proxy.cuh"
+#include "basalt/kernels/head_proxy.cuh"
 #include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
@@ -20,7 +15,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
-#include "basalt/kernels/volta_compat.cuh"
 
 namespace basalt::kernels {
 namespace {
@@ -281,6 +275,17 @@ void launch_nc(const void* w, const void* x, float* y, int n_out, cudaStream_t s
 
 // ---- the 2-bit copy and the two-stage argmax (head_proxy.cuh)
 
+constexpr int kProxyIn = 2560;   // the copy's row width
+
+// The approximate pass over the 2-bit copy, a tile of 32 rows a block (head_proxy.cuh).
+__global__ void __launch_bounds__(128) proxy_score_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
+                                                         const px::X81* __restrict__ x, int n_rows,
+                                                         const int32_t* __restrict__ map, float2* __restrict__ cand,
+                                                         float2* __restrict__ part) {
+    __shared__ px::ScoreShared<kProxyIn> sh;
+    px::score_tile<kProxyIn, true>(sh, (int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
+}
+
 // One row's logit by one warp, in q6k_rows' order (the same bits as its one-column result).
 __device__ __forceinline__ float q6k_row_one(const Q6KBlock* __restrict__ w, const int2* __restrict__ x, int lane) {
     constexpr int kb[BPR] = {0, 4, 8, 1, 5, 9, 2, 6, 3, 7};
@@ -313,7 +318,7 @@ __global__ void q6k_proxy_pack_kernel(const Q6KBlock* __restrict__ q6, int64_t r
         const int hi = (b->qh[32 * h + ll] >> (2 * quarter)) & 3;
         w[l] = d * (float) b->scales[8 * h + ll / 16 + 2 * quarter] * (float) ((lo | (hi << 4)) - 32);
     }
-    px::pack_group<true>(w, row, g, wq, sc);
+    px::pack_group<kProxyIn, true>(w, row, g, wq, sc);
 }
 
 // One block: the rows near the best approximate score are scored exactly (a warp per row), the exact best is the pick.
@@ -336,7 +341,7 @@ __global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __
         xe[i] = make_int2(__ldg(reinterpret_cast<const int*>(blk->qs) + pos),
                           __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))));
     }
-    const int n = px::collect(f, n_tiles, map, cand, out_id, out_prob);
+    const int n = px::collect<true, true>(f, n_tiles, map, cand, out_id, out_prob);
     if (n == 0) return;
     for (int c = warp; c < n; c += 16) {
         const int r = f.list[c];
@@ -345,7 +350,7 @@ __global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __
     }
     __syncthreads();
     if (warp != 0) return;
-    px::pick(f, n, n_tiles, map, part, out_id, out_prob);
+    px::pick<true, true>(f, n, n_tiles, map, part, out_id, out_prob);
 }
 
 // ---- the verify head: a 2-bit copy of every row scored on the tensor cores, then exact rescoring near the top
@@ -372,7 +377,9 @@ struct VScratch {   // the scoring kernel's last block leaves its part zeroed fo
 };
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    basalt::volta::mma_16832_s32_s8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1, 0, 0, 0, 0);
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
 }
 
 // One thread per (row, group): the group's dequantized Q6_K values fitted as head_proxy.cuh fits them, its levels
@@ -529,7 +536,7 @@ __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict
 #pragma unroll
         for (int i = 0; i < VHIST / 32; ++i) v[i] = __ldcg(&vs->hist[c][i * 32 + lane]);
 #pragma unroll
-        for (int i = 0; i < VHIST / 32; ++i) tot[i] = BASALT_REDUCE_ADD(0xffffffffu, v[i]);
+        for (int i = 0; i < VHIST / 32; ++i) tot[i] = __reduce_add_sync(0xffffffffu, v[i]);
         unsigned run = 0, row_v = 0;
         int row = -1;
 #pragma unroll
@@ -721,7 +728,7 @@ void q6k_proxy_pack(const void* q6k_rows, int64_t row0, int64_t n, void* proxy, 
     if (n <= 0) return;
     const int64_t total = n * 80;
     q6k_proxy_pack_kernel<<<(unsigned) ((total + 127) / 128), 128, 0, (cudaStream_t) stream>>>(
-        (const Q6KBlock*) q6k_rows, row0, n, (uint4*) proxy, px::scales(proxy, n_cap), rows);
+        (const Q6KBlock*) q6k_rows, row0, n, (uint4*) proxy, px::scales(proxy, n_cap, kProxyIn), rows);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "q6k_proxy_pack: %s", cudaGetErrorString(e));
@@ -735,10 +742,10 @@ bool q6k_proxy_top1(const void* proxy, const void* q6k_rows, const void* x_q8_1,
         return false;
     const int tiles = (int) px::tiles(n_rows);
     const uint4* wq = (const uint4*) proxy;
-    const uint32_t* sc = (const uint32_t*) px::scales(const_cast<void*>(proxy), n_cap);
+    const uint32_t* sc = (const uint32_t*) px::scales(const_cast<void*>(proxy), n_cap, kProxyIn);
     float2* cand = (float2*) scratch;
     float2* part = cand + (size_t) px::tiles(n_cap) * px::kPer;
-    launch_pdl(px::score_kernel, dim3((unsigned) tiles), dim3(128), 0, (cudaStream_t) stream, wq, sc,
+    launch_pdl(proxy_score_kernel, dim3((unsigned) tiles), dim3(128), 0, (cudaStream_t) stream, wq, sc,
                (const px::X81*) x_q8_1, n_rows, map, cand, part);
     launch_pdl(q6k_proxy_final_kernel, dim3(1), dim3(512), 0, (cudaStream_t) stream, (const Q6KBlock*) q6k_rows,
                (const Q81Block*) x_q8_1, tiles, map, (const float2*) cand, (const float2*) part, out_id, out_prob,
