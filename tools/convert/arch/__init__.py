@@ -58,5 +58,5 @@ def register(arch: Arch, *names: str) -> None:
 
 def for_architecture(name) -> Arch:
     """The rules for `general.architecture`; an architecture without its own entry is converted as Flash-Next."""
-    from . import qwen4exp, deepseek41  # noqa: F401  (register themselves)
+    from . import qwen4exp, deepseek41, inkling2  # noqa: F401  (register themselves)
     return REGISTRY.get(name) or REGISTRY["qwen4exp"]

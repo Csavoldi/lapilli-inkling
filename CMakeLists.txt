@@ -206,6 +206,14 @@ target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
+if(BASALT_MODEL_INKLING2)
+add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/model.cpp
+  src/models/inkling2/session.cpp src/models/inkling2/pretok_inkling2.cpp
+  src/models/inkling2/kernels/ink_kernels.cu)
+target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_inkling2 PUBLIC model tokenizer serve_shared kernels core ${_gpu_runtime_target})
+endif()
+
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it

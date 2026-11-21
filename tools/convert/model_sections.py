@@ -4,6 +4,10 @@
   experts / experts.layout  per layer, n_expert blobs of [gate | up | down] rows, and where each layer starts
   mtp/dense, mtp/dense.index, mtp/experts  the draft layer from the BF16 `mtp.*` tensors (tools/convert/mtp_fetch.py)
 
+A model may merge gate and up into `ffn_gate_up_exps` (gate rows first); NVFP4 layers with a per-expert FP32
+`.scale` companion per tensor are requantized onto the Volta lanes: Q4_K gate/up rows (n_embd whole 256-value
+blocks), Q8_0 down rows (n_ff is not).  Q8_0 layers keep their bytes.
+
 Sections are produced as byte-chunk iterators for ModelWriter.add_chunks. Needs numpy.
 """
 from __future__ import annotations
@@ -33,14 +37,24 @@ class ConvertError(Exception):
 
 FLOAT = {"BF16", "F32", "F16"}
 ROLES = ("gate", "up", "down")
+ROLES_MERGED = ("gate_up", "down")
 ALIGN = 64                      # between the tensors of `dense`
 EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.(weight|scale|input_scale)$")
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 QWEN = for_architecture("qwen4exp")
+NVFP4 = 40
 
 
 def form_of(name: str, arch=QWEN):
     return arch.form_of(name)
+
+
+def ggml_row_size(type_id: int, n: int) -> int:
+    """Bytes of one GGML row of n values in a block format (whole blocks only)."""
+    vals, byts = ggufq.GGML_QUANT_SIZES[ggufq.GGMLQuantizationType(type_id)]
+    if n % vals:
+        raise ConvertError(f"a row of {n} values is not whole {vals}-value blocks (type {type_id})")
+    return n // vals * byts
 
 
 # ------------------------------------------------------------------ the source model
@@ -267,7 +281,11 @@ class Dense:
 
 # ------------------------------------------------------------------ experts
 class Experts:
-    """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
+    """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it.
+
+    Every layer uses the same roles: `gate`, `up` and `down`, or the merged `gate_up` (gate rows first) and `down`.
+    NVFP4 layers that carry an FP32 `.scale` per expert per tensor are requantized: gate/up rows to Q4_K, down rows
+    to Q8_0, the per-expert scales multiplied in before the requant."""
 
     def __init__(self, model: SourceModel):
         T = {n: w[1] for n, w in model.where.items()}
@@ -280,18 +298,43 @@ class Experts:
         self.n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])
         if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in range(self.n_layers)):
             raise ConvertError("the routers disagree on the expert count; a per-layer pruned model cannot be converted")
+        self.merged = (all("blk.%d.ffn_gate_up_exps.weight" % l in T for l in range(self.n_layers)) and
+                       not any("blk.%d.ffn_gate_exps.weight" % l in T for l in range(self.n_layers)))
+        roles = ROLES_MERGED if self.merged else ROLES
+        self.roles = roles
         self.layout = []
+        self.requant: list = []
         offset = 0
         for l in range(self.n_layers):
-            names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
+            names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in roles]
             if any(n not in T for n in names):
                 raise ConvertError("layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T)))
             ts = [T[n] for n in names]
             if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != self.n_expert for t in ts):
                 raise ConvertError("layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, self.n_expert))
-            per = [t.expected_bytes() // self.n_expert for t in ts]
-            blob = sum(per)
-            self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names, ts[1].type_id))
+            gu, dn = ts[0], ts[-1]
+            if gu.type_id == NVFP4 or dn.type_id == NVFP4:
+                if not self.merged or gu.type_id != NVFP4 or dn.type_id != NVFP4:
+                    raise ConvertError("layer %d: NVFP4 experts are only converted merged (gate_up and down together)"
+                                       % l)
+                scales = ["blk.%d.ffn_%s_exps.scale" % (l, r) for r in roles]
+                bad = [s for s in scales if s not in T or T[s].type_name != "F32"
+                       or int(T[s].shape[0]) != self.n_expert]
+                if bad:
+                    raise ConvertError("layer %d: NVFP4 experts need one FP32 `.scale` value per expert per tensor "
+                                       "(missing or wrong: %s)" % (l, ", ".join(bad)))
+                n_embd, two_ff, n_ff = (int(v) for v in list(gu.shape[0:2]) + [dn.shape[0]])
+                if two_ff != 2 * n_ff:
+                    raise ConvertError("layer %d: gate_up has %d rows, down wants %d" % (l, two_ff, 2 * n_ff))
+                gt, ut, dt = 12, 12, 8           # Q4_K gate/up rows (n_embd whole blocks), Q8_0 down rows
+                blob = 2 * ggml_row_size(gt, n_embd) * n_ff + ggml_row_size(dt, n_ff) * n_embd
+                self.requant.append({"n_embd": n_embd, "n_ff": n_ff, "scales": scales})
+            else:
+                gt, ut, dt = gu.type_id, gu.type_id, dn.type_id
+                per = [t.expected_bytes() // self.n_expert for t in ts]
+                blob = sum(per)
+                self.requant.append(None)
+            self.layout.append((l, gt, dt, offset, blob, names, ut))
             offset += blob * self.n_expert
         self.total = offset
 
@@ -309,15 +352,47 @@ class Experts:
         return (head + "".join("%d %d %d %d %d %d\n" % (l, gt, dt, off, blob, ut)
                                for l, gt, dt, off, blob, _, ut in self.layout)).encode("utf-8")
 
-    def chunks(self, group: int = 32):
-        """The blobs layer by layer, `group` experts at a time: each expert is [gate | up | down] of its slices."""
-        for l, gt, dt, off, blob, names, _ in self.layout:
-            arrays = [self.model.bytes(n).reshape(self.n_expert, -1) for n in names]
-            for s in range(0, self.n_expert, group):
-                yield np.concatenate([a[s:s + group] for a in arrays], axis=1).tobytes()
+    def _layer_jobs(self, i):
+        """The per-expert requant jobs of layer i, in expert order."""
+        l, gt, dt, off, blob, names, ut = self.layout[i]
+        rq = self.requant[i]
+        gu_path, gu_off, gu_size = self.model.abs_range(names[0])
+        dn_path, dn_off, dn_size = self.model.abs_range(names[1])
+        if gu_path != dn_path:
+            raise ConvertError("layer %d: the expert tensors span shards; requant needs them together" % l)
+        per_gu, per_dn = gu_size // self.n_expert, dn_size // self.n_expert
+        _, sg_off, _ = self.model.abs_range(rq["scales"][0])
+        _, sd_off, _ = self.model.abs_range(rq["scales"][1])
+        for e in range(self.n_expert):
+            yield (str(gu_path), gu_off + e * per_gu, per_gu, dn_off + e * per_dn, per_dn,
+                   sg_off + 4 * e, sd_off + 4 * e, rq["n_embd"], rq["n_ff"])
+
+    def chunks(self, group: int = 32, workers: int = 16):
+        """The blobs layer by layer: each expert is [gate | up | down] rows.  Requant layers run on a process pool."""
+        pool = None
+        try:
+            for i, (l, gt, dt, off, blob, names, _) in enumerate(self.layout):
+                if self.requant[i] is None:
+                    arrays = [self.model.bytes(n).reshape(self.n_expert, -1) for n in names]
+                    for s in range(0, self.n_expert, group):
+                        yield np.concatenate([a[s:s + group] for a in arrays], axis=1).tobytes()
+                    continue
+                if pool is None:
+                    import multiprocessing
+                    pool = multiprocessing.Pool(workers)
+                queue = deque()
+                for job in self._layer_jobs(i):
+                    queue.append(pool.apply_async(_requant_expert, (job,)))
+                    if len(queue) >= 2 * workers:
+                        yield queue.popleft().get()
+                while queue:
+                    yield queue.popleft().get()
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
 
-NVFP4 = 40
 NVFP4_TAIL = 16          # per expert, after down: FP32 {s_gate, s_up, s_down, 0}
 
 
@@ -333,6 +408,139 @@ def nvfp4_layout_text(n_expert: int, total: int, layout) -> bytes:
     head = ("# experts v6: layer gu_type d_type offset blob_bytes (n_expert %d, total %d); "
             "an NVFP4 blob ends in FP32 {s_gate, s_up, s_down, 0}\n" % (n_expert, total))
     return (head + "".join("%d %d %d %d %d\n" % x for x in layout)).encode("utf-8")
+
+
+# ------------------------------------------------------------------ NVFP4 dequantization and Q4_K requantization
+# kvalues_fp4: E2M1 values doubled (ggml convention), shared by MXFP4 and NVFP4
+_FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
+
+
+def _ue4m3(x: np.ndarray) -> np.ndarray:
+    """ggml's UE4M3 scale decode (bias 7, x==0 and the 0x7F code are zero), including its value*0.5 convention."""
+    exp = ((x >> 3) & 0xF).astype(np.int32)
+    man = (x & 7).astype(np.float32)
+    with np.errstate(over="ignore"):
+        raw = np.where(exp == 0,
+                       man * np.float32(2.0 ** -9),
+                       (1.0 + man * np.float32(0.125)) * np.exp2(exp.astype(np.float32) - 7))
+    out = raw * np.float32(0.5)
+    return np.where((x == 0) | (x == 0x7F), np.float32(0.0), out)
+
+
+def nvfp4_values(raw: np.ndarray) -> np.ndarray:
+    """NVFP4 blocks (64 values: 4 UE4M3 scale bytes, then 32 bytes of packed E2M1 nibbles, low nibbles of the 8
+        bytes first) as float32, in ggml's dequantize_row_nvfp4 order."""
+    b = raw.reshape(-1, 36)
+    sc = _ue4m3(b[:, :4])                                        # [nb, 4]
+    q = b[:, 4:].reshape(-1, 4, 8)
+    lo = _FP4[q & 0x0F]
+    hi = _FP4[q >> 4]
+    sub = np.concatenate([lo, hi], axis=2)                       # [nb, 4, 16]: lows then highs
+    return (sub * sc[:, :, None]).reshape(-1)
+
+
+Q4K_BLOCK, Q4K_BYTES = 256, 144
+
+
+def q4_k(x: np.ndarray) -> bytes:
+    """ggml's quantize_row_q4_K_ref vectorized over all blocks: 8 groups of 32 values, each with an unsigned 4-bit
+        level l in [0, 15] and its own scale and min; the 16 group scales and mins pack as 6-bit values into 12
+        bytes against one fp16 super-scale each (d, dmin).  The group search is ggml's make_qkx2 (21 candidate
+        grids, weighted least squares, the error weight av_x + |x|), the levels re-rounded against the scales as
+        stored."""
+    nb = x.size // Q4K_BLOCK
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(nb, 8, 32)
+    av = np.sqrt((x * x).mean(-1, keepdims=True))
+    w = av + np.abs(x)
+    min_ = np.minimum(x.min(-1, keepdims=True), np.float32(0))
+    max_ = x.max(-1, keepdims=True)
+    eq = max_ == min_                                   # constant at or below zero: levels 0, scale 0
+    span = np.where(eq, np.float32(1), max_ - min_)
+    sum_w = w.sum(-1, keepdims=True)
+    sum_x = (w * x).sum(-1, keepdims=True)
+    scale = 1.0 / (np.float32(15) / span)
+    L = np.clip(np.rint((np.float32(15) / span) * (x - min_)), 0, 15)
+    best_err = (w * (scale * L + min_ - x) ** 2).sum(-1, keepdims=True)
+    best_scale, best_min, best_L = scale, min_, L
+    for s in range(21):
+        isc = (np.float32(-1) + np.float32(0.1) * s + np.float32(15)) / span
+        Lx = np.clip(np.rint(isc * (x - min_)), 0, 15)
+        sum_l = (w * Lx).sum(-1, keepdims=True)
+        sum_l2 = (w * Lx * Lx).sum(-1, keepdims=True)
+        sum_xl = (w * Lx * x).sum(-1, keepdims=True)
+        D = sum_w * sum_l2 - sum_l * sum_l
+        ok = D > 0
+        Dsafe = np.where(ok, D, 1)
+        ts = (sum_w * sum_xl - sum_x * sum_l) / Dsafe
+        tm = (sum_l2 * sum_x - sum_l * sum_xl) / Dsafe
+        pos = ok & (tm > 0)
+        ts = np.where(pos, sum_xl / np.where(sum_l2 > 0, sum_l2, 1), ts)
+        tm = np.where(pos, np.float32(0), tm)
+        err = (w * (ts * Lx + tm - x) ** 2).sum(-1, keepdims=True)
+        better = ok & (err < best_err) & ~eq
+        best_err = np.where(better, err, best_err)
+        best_scale = np.where(better, ts, best_scale)
+        best_min = np.where(better, tm, best_min)
+        best_L = np.where(better, Lx, best_L)
+    best_scale = np.where(eq, np.float32(0), best_scale)
+    best_min = np.where(eq, min_, best_min)             # the_min = -min >= 0
+    best_L = np.where(eq, np.float32(0), best_L)
+    scales = best_scale.astype(np.float64).reshape(nb, 8)
+    mins = (-best_min).astype(np.float64).reshape(nb, 8)    # >= 0
+    max_scale = scales.max(1)
+    max_min = mins.max(1)
+    inv_scale = np.where(max_scale > 0, 63.0 / np.where(max_scale > 0, max_scale, 1), 0.0)
+    inv_min = np.where(max_min > 0, 63.0 / np.where(max_min > 0, max_min, 1), 0.0)
+    ls = np.minimum(np.rint(inv_scale[:, None] * scales), 63).astype(np.uint8)
+    lm = np.minimum(np.rint(inv_min[:, None] * mins), 63).astype(np.uint8)
+    sc = np.zeros((nb, 12), dtype=np.uint8)
+    for j in range(8):
+        if j < 4:
+            sc[:, j] = ls[:, j]
+            sc[:, j + 4] = lm[:, j]
+        else:
+            sc[:, j + 4] = (ls[:, j] & 0xF) | ((lm[:, j] & 0xF) << 4)
+            sc[:, j - 4] |= (ls[:, j] >> 4) << 6
+            sc[:, j] |= (lm[:, j] >> 4) << 6
+    d16 = (max_scale / 63.0).astype(np.float16)
+    dm16 = (max_min / 63.0).astype(np.float16)
+    # the levels are re-rounded against the scales as the reader sees them
+    sc_v = sc.view(np.uint8)
+    jj = np.arange(8)
+    d_scales = np.where(jj < 4, sc_v[:, jj] & 63,
+                        (sc_v[:, jj + 4] & 0xF) | (sc_v[:, jj - 4] >> 6) << 4).astype(np.float32)
+    m_scales = np.where(jj < 4, sc_v[:, jj + 4] & 63,
+                        (sc_v[:, jj + 4] >> 4) | (sc_v[:, jj] >> 6) << 4).astype(np.float32)
+    d_eff = d16.astype(np.float32)[:, None] * d_scales
+    dm_eff = dm16.astype(np.float32)[:, None] * m_scales
+    deff = d_eff[:, :, None]
+    Lr = np.where(deff != 0, np.rint((x + dm_eff[:, :, None]) / np.where(deff != 0, deff, 1)), 0)
+    Lr = np.clip(Lr, 0, 15).astype(np.uint8).reshape(nb, 4, 2, 32)
+    qs = (Lr[:, :, 0, :] | (Lr[:, :, 1, :] << 4)).reshape(nb, 128)
+    out = np.empty((nb, Q4K_BYTES), dtype=np.uint8)
+    out[:, 0:2] = d16.view(np.uint8).reshape(nb, 2)
+    out[:, 2:4] = dm16.view(np.uint8).reshape(nb, 2)
+    out[:, 4:16] = sc
+    out[:, 16:144] = qs
+    return out.tobytes()
+
+
+def _requant_expert(job):
+    """One NVFP4 expert as a [gate | up | down] blob: Q4_K gate/up rows, Q8_0 down rows, the per-expert FP32
+        scales multiplied in before the requant."""
+    path, gu_off, gu_size, dn_off, dn_size, sg_off, sd_off, n_embd, n_ff = job
+    with open(path, "rb") as f:
+        f.seek(gu_off)
+        gu = np.frombuffer(f.read(gu_size), dtype=np.uint8)
+        f.seek(dn_off)
+        dn = np.frombuffer(f.read(dn_size), dtype=np.uint8)
+        f.seek(sg_off)
+        sg = np.frombuffer(f.read(4), dtype="<f4")[0]
+        f.seek(sd_off)
+        sd = np.frombuffer(f.read(4), dtype="<f4")[0]
+    gate_up = nvfp4_values(gu) * sg                      # [2*n_ff, n_embd] row-major
+    down = nvfp4_values(dn) * sd                         # [n_embd, n_ff] row-major
+    return q4_k(gate_up) + q8_0(down)
 
 
 # ------------------------------------------------------------------ the drafter
@@ -568,7 +776,7 @@ def bounded_imap(pool, fn, jobs, depth: int):
 
 class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
-    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
+        BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
 
     def __init__(self, path, chunk_rows: int = 65536):
         self.path, self.chunk_rows = path, chunk_rows
@@ -614,8 +822,8 @@ Q6K_BLOCK, Q6K_BYTES = 256, 210
 
 def q6_k(x: np.ndarray) -> bytes:
     """Q6_K blocks of 256 over a float32 array (length a multiple of 256): per 16-value group the least-squares
-    scale from the signed-max starting grid, 8-bit group scales against one fp16 super-scale, values re-rounded
-    against the scales as stored. The layout is ggml block_q6_K."""
+        scale from the signed-max starting grid, 8-bit group scales against one fp16 super-scale, values re-rounded
+        against the scales as stored. The layout is ggml block_q6_K."""
     nb = x.size // Q6K_BLOCK
     x = np.ascontiguousarray(x, dtype=np.float32).reshape(nb, 16, 16)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -718,8 +926,8 @@ def _q6k_job(args):
 
 class DenseQ6K:
     """Q6_K stand-ins for the Q8_0 dense projections of a pack, quantized from the checkpoint's BF16 tensors when
-    `checkpoint` (a directory of safetensors shards) is given, else from the pack's own Q8_0 values. Each BF16
-    tensor is checked against the pack's Q8_0 copy: a name or layout mismatch shows as a distance above one step."""
+        `checkpoint` (a directory of safetensors shards) is given, else from the pack's own Q8_0 values. Each BF16
+        tensor is checked against the pack's Q8_0 copy: a name or layout mismatch shows as a distance above one step."""
 
     def __init__(self, tensors: dict, checkpoint=None):
         hf = {}
