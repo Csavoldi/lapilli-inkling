@@ -14,8 +14,10 @@ namespace basalt::models::inkling2 {
 namespace {
 
 class Adapter final : public model::ModelAdapter {
+    const char* arch_ = kArch;
 public:
-    const char* arch() const override { return kArch; }
+    explicit Adapter(const char* a = kArch) : arch_(a) {}
+    const char* arch() const override { return arch_; }
     std::string validate(const GgufFile& g) const override { return validate_meta(g); }
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<InklingModel>(); }
@@ -63,6 +65,11 @@ public:
 
 }  // namespace
 
-std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Adapter>(); }
+std::unique_ptr<model::ModelAdapter> make_adapter() {
+    // GGUF exports of the looped layout name the architecture `inkling2_loop`; the same adapter answers to it.
+    if (model::find_adapter("inkling2_loop") == nullptr)
+        model::register_adapter(std::make_unique<Adapter>("inkling2_loop"));
+    return std::make_unique<Adapter>();
+}
 
 }  // namespace basalt::models::inkling2

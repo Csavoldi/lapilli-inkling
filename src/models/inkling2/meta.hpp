@@ -10,16 +10,25 @@
 namespace basalt::models::inkling2 {
 
 inline constexpr const char* kArch = "inkling2";
+// GGUF exports of the looped layout name the architecture and every model key `inkling2_loop.*`; the converter's
+// packs use `inkling2.*`. Both spell the same model, so keys are read under either prefix.
+inline constexpr const char* kArchLoop = "inkling2_loop";
+
+inline const MetaValue* key_any(const GgufFile& g, const char* suffix) {
+    const MetaValue* v = g.get(std::string(kArch) + "." + suffix);
+    return v ? v : g.get(std::string(kArchLoop) + "." + suffix);
+}
 
 inline uint64_t key_u(const GgufFile& g, const char* suffix) {
-    const MetaValue* v = g.get(std::string(kArch) + "." + suffix);
+    const MetaValue* v = key_any(g, suffix);
     return v ? v->u : 0;
 }
 
 inline std::string validate_meta(const GgufFile& g) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != kArch) return "architecture is '" + arch->s + "', this adapter requires '" + kArch + "'";
+    if (arch->s != kArch && arch->s != kArchLoop)
+        return "architecture is '" + arch->s + "', this adapter requires '" + kArch + "'";
     for (const char* k : {"block_count", "embedding_length", "expert_count", "expert_used_count", "expert_feed_forward_length",
                           "loop.start", "loop.end", "loop.count", "attention.sliding_window"})
         if (key_u(g, k) == 0) return std::string("missing or zero ") + kArch + "." + k;

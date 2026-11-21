@@ -8,7 +8,18 @@ namespace {
 
 using core::Json;
 
-double num_or(const Json* j, double d) { return j && j->is_number() ? j->num() : d; }
+double num_or(const Json* j, double d) {
+    if (j && j->is_number()) return j->num();
+    // The GGUF export repeats per-layer settings as arrays; every layer of this model agrees, so a uniform
+    // array reads as its value.
+    if (j && j->is_array() && !j->items.empty() && j->items.front().is_number()) {
+        const double v = j->items.front().num();
+        for (const Json& x : j->items)
+            if (!x.is_number() || x.num() != v) return d;
+        return v;
+    }
+    return d;
+}
 
 std::vector<bool> bools(const Json* j) {
     std::vector<bool> v;
@@ -49,7 +60,11 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         err = path + ": meta has no gguf_kv / tensors";
         return false;
     }
-    auto k = [&](const char* s) { return kv->get(std::string("inkling2.") + s); };
+    // GGUF-derived packs keep the looped export's `inkling2_loop.*` keys; the converter's write `inkling2.*`.
+    auto k = [&](const char* s) {
+        const Json* v = kv->get(std::string("inkling2.") + s);
+        return v ? v : kv->get(std::string("inkling2_loop.") + s);
+    };
     auto u = [&](const char* s, double d = 0) { return (int) num_or(k(s), d); };
     auto f = [&](const char* s, double d = 0) { return (float) num_or(k(s), d); };
     Geometry& g = p.geo;
