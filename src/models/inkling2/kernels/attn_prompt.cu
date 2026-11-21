@@ -9,6 +9,7 @@
 // tensor cores with fp32 accumulation, and the sink joins the denominator at the end. A key at or after the chunk's first
 // position comes from the chunk's own buffer (a full layer's cache, a sliding-window layer's stage), an earlier one from
 // the cache (a window ring or the full cache).
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -57,25 +58,31 @@ void check(const char* what) {
 }
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
+// ldmatrix is sm_75 and mma.m16n8k16 sm_80: on Volta the fork's volta_compat emulation provides them (the fork's
+// gqa_attn and window-gemm kernels take the same route), and cp.async's copies become synchronous shared stores
 __device__ __forceinline__ void ldsm_x2(unsigned& r0, unsigned& r1, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(smem_u32(p)));
+    uint32_t r[2];
+    basalt::volta::ldsm<2, false>(r, smem_u32(p));
+    r0 = r[0]; r1 = r[1];
 }
 __device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+    uint32_t r[4];
+    basalt::volta::ldsm<4, false>(r, smem_u32(p));
+    r0 = r[0]; r1 = r[1]; r2 = r[2]; r3 = r[3];
 }
 __device__ __forceinline__ void ldsm_x4_t(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+    uint32_t r[4];
+    basalt::volta::ldsm<4, true>(r, smem_u32(p));
+    r0 = r[0]; r1 = r[1]; r2 = r[2]; r3 = r[3];
 }
 __device__ __forceinline__ void mma16816(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    const uint32_t a[4] = {a0, a1, a2, a3}, b[2] = {b0, b1};
+    const float cin[4] = {c[0], c[1], c[2], c[3]};
+    basalt::volta::mma_m16n8k16_f32<false>(c, a, b, cin);
 }
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool ok) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 16 : 0));
+    basalt::volta::cp_async_cg16(smem_u32(dst), src, ok ? 16 : 0);
 }
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
@@ -199,15 +206,16 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
         if (!ready) {
             cur = 0;
             load_tile<FP8>(a, sm.t0, kvh, k0, lo, hi, tid);
-            asm volatile("cp.async.commit_group;\n" ::: "memory");
+            basalt::volta::cp_async_commit();
         }
         // a far tile followed by a far tile: the next one is requested into the other room before this one is used
         const bool next = !FP8 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
         if (next) {
             load_tile<FP8>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
-            asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
+            basalt::volta::cp_async_commit();
+            basalt::volta::cp_async_wait<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            basalt::volta::cp_async_wait<0>();
         }
         const KvTile& kt = cur ? sm.u.t1 : sm.t0;
         ready = next;

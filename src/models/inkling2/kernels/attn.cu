@@ -9,6 +9,7 @@
 // them to the q8_1 blocks of the output projection.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "prep.cuh"
 
@@ -18,7 +19,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -26,6 +29,29 @@ namespace basalt::models::inkling2 {
 namespace {
 
 namespace bk = basalt::kernels;
+
+// Volta (this fork's target) has no thread block clusters: the fused window kernel is Hopper-and-later, and the
+// host takes the split-and-combine path there instead.
+bool cluster_device() {
+    static std::atomic<int> cc[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return false;
+    }
+    int c = cc[dev].load(std::memory_order_acquire);
+    if (c == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        c = 10 * major + minor;
+        cc[dev].store(c, std::memory_order_release);
+    }
+    return c >= 90;
+}
 
 constexpr int kWarps = 4;
 constexpr int kTile = 32;
@@ -321,7 +347,7 @@ struct FusedSmem {
 };
 
 template <bool FP8>
-__global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
+__global__ void BASALT_CLUSTER_DIMS(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     FusedSmem& fs = *reinterpret_cast<FusedSmem*>(smem_raw);
@@ -518,7 +544,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             }
         }
     }
-    cg::cluster_group cluster = cg::this_cluster();
+    BASALT_CLUSTER_T cluster = BASALT_THIS_CLUSTER();
     cluster.sync();
     if (s < kGroup) {   // head g * 3 + s: the row's slices merged with the sink, gated, rounded to q8_1 (a warp a block of 32)
         const int h = s, d = threadIdx.x;
@@ -546,7 +572,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // no block leaves while the merging blocks still read its slice: an arrival without release semantics (a release
     // here is a GPU-scope fence that waits for the q8_1 stores to be acknowledged); the merging blocks' remote loads
     // are complete, their values are in the stores above
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
+    BASALT_CLUSTER_ASM("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;");
 }
 
 int launch_splits(int64_t max_keys) {
@@ -582,7 +608,7 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr) {
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || !cluster_device()) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
