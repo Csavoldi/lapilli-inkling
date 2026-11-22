@@ -1,5 +1,9 @@
 # Lapilli: Basalt on NVIDIA V100
 
+> **Current work in this fork: Inkling 2 Mini (`inkling2_loop`) on V100 — ported from upstream
+> Basalt v0.5.5, validated against llama.cpp (KL 0.0001–0.0005), 69→44 tok/s decode up to 165K
+> context on one card. See [INKLING2.md](INKLING2.md).**
+
 Lapilli is a port of [Basalt](https://github.com/jesdga95/basalt), the local inference engine for **Qwen3.8-Flash-Next**,
 to **NVIDIA V100** GPUs (Volta, compute capability 7.0). Upstream Basalt targets Blackwell (sm_120) only and does not take
 other architectures; this fork adds sm_70 and keeps the Blackwell build as it was.
