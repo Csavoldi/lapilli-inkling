@@ -586,7 +586,7 @@ private:
         // kGuessExperts / rows best) into L2 on the other side stream, while the attention and the glue before the experts
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
-        const bool guess = rows <= kGuessRows;
+        const bool guess = rows <= kGuessRows && rows != 1;
         if (guess && vi > 0) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(pf_ev_, stream_);
@@ -637,7 +637,7 @@ private:
         bk::native_q8_0_mmvq(w.out, xo_, o_, kOutRows, E, rows, stream_);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
-        if (!guess) {
+        if (!guess && rows != 1) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(ra_ev_, stream_);
             cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
