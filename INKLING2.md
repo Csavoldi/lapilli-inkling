@@ -7,6 +7,9 @@ Upstream v0.5.5 targets Blackwell (sm_120a: fp4/fp8 tensor cores, clusters, TMA)
 the fork's Volta lanes alive — the `basalt::volta::` shims, dp4a MMQ, emulated mma — so the whole
 Inkling 2 pipeline runs on sm_70.
 
+Like the rest of this fork's work, the port was vibe coded: performed using GLM 5.3 (Z.ai) as an
+interactive coding agent.
+
 ## Status (validated 2026-11-21, 2×V100 PCIe 32GB, one card in use)
 
 | gate | result |

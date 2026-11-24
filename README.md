@@ -4,6 +4,9 @@
 > Basalt v0.5.5, validated against llama.cpp (KL 0.0001–0.0005), 69→44 tok/s decode up to 165K
 > context on one card. See [INKLING2.md](INKLING2.md).**
 
+> **Vibe coded:** the work in this fork was performed using **GLM 5.3** (Z.ai), driven as an interactive coding agent —
+> the V100 port and the Inkling 2 Mini adapter alike.
+
 Lapilli is a port of [Basalt](https://github.com/jesdga95/basalt), the local inference engine for **Qwen3.8-Flash-Next**,
 to **NVIDIA V100** GPUs (Volta, compute capability 7.0). Upstream Basalt targets Blackwell (sm_120) only and does not take
 other architectures; this fork adds sm_70 and keeps the Blackwell build as it was.
@@ -95,6 +98,29 @@ bin\basalt.exe serve models\Qwen3.8-FN-UD-Q4_K_XL.basalt --gpu 0,1 --kv int8 --m
 
 Then open `http://127.0.0.1:8080/`. Every flag works as in Basalt: see its [running](docs/running.md) and
 [configuration](docs/configuration/index.md) pages (this repository's `docs/` is Basalt's documentation, written for Blackwell).
+
+## How the port to V100 was done
+
+The fork keeps Basalt's engine, its architecture and its Blackwell build exactly as they are and adds a Volta lane
+underneath; nothing is re-architected for sm_70. Three rules carried the work:
+
+**Compile everything first.** The build accepts compute capability 7.0 beside 12.0 (CUDA 12.6 to 12.9; CUDA 13 dropped
+Volta), and the compatibility layer translates every newer PTX instruction to a correct sm_70 equivalent, so all of
+Basalt's kernels compile and run on a V100 before any of them is touched.
+
+**Rewrite only what the hardware forces.** Where Blackwell has paths a V100 cannot answer (FP8 and FP4 tensor cores,
+clusters, TMA), the engine takes its portable fallbacks, and the memory planner tiers experts between VRAM and host RAM
+so packs larger than VRAM and long contexts still fit on 32 GB cards. The kernels on every token's critical path got
+real Volta versions instead: dp4a prompt products (from llama.cpp), int8 prompt attention on the V100 tensor cores
+(from Strata), and Volta rewrites of the decode experts, the GDN recurrence, the router and the expert exchange between
+two cards.
+
+**Trust numerics, never plausible text.** Every change was gated: the converter and new kernels against scalar
+reference implementations, the engine against Basalt's quality gate (perplexity, mean KLD, top-1 against the BF16
+reference) and its 122 GPU parity tests (108 pass on a V100; the rest only exercise paths a V100 never takes), and the
+Inkling 2 pipeline against llama.cpp logits (KL 0.0001–0.0005). A first from-scratch Inkling engine was thrown away
+when it failed that gate; the shipped port merges upstream v0.5.5's validated Inkling 2 implementation onto this fork
+instead, hand-resolving the conflicts in favour of the Volta paths (see [INKLING2.md](INKLING2.md)).
 
 ## What changed from Basalt
 
