@@ -14,3 +14,6 @@ __pycache__/
 /mtp/
 /.ccache/
 .DS_Store
+
+# security-scanner hook state (local tooling, not part of the project)
+.mimosa/
